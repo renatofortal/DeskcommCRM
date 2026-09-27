@@ -130,12 +130,22 @@ def mcp_tools() -> list[dict]:
         },
         {
             "name": "whatsapp_grupos",
-            "description": "Lista os grupos deste WhatsApp: id, nome e quantidade de participantes.",
+            "description": "Lista todos os grupos deste WhatsApp: id, nome e quantidade de participantes. Para ler as mensagens, use whatsapp_mensagens_grupo.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         },
         {
             "name": "whatsapp_grupo",
-            "description": "Detalha um grupo pelo id terminado em @g.us.",
+            "description": "Detalha um grupo pelo id terminado em @g.us. Nao traz as mensagens; para isso use whatsapp_mensagens_grupo.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "whatsapp_mensagens_grupo",
+            "description": "Le as mensagens recentes de qualquer grupo deste WhatsApp. O id termina em @g.us.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string"}},
@@ -193,6 +203,89 @@ def _group_brief(group_id: str, group: object) -> dict:
         "nome": str(group.get("subject") or group.get("name") or ""),
         "participantes": size,
     }
+
+
+def _texto_de_mensagem(item: dict) -> str:
+    body = item.get("body")
+    if isinstance(body, str) and body.strip():
+        return body.strip()
+    message = item.get("message") if isinstance(item.get("message"), dict) else {}
+    conversation = message.get("conversation")
+    if isinstance(conversation, str) and conversation.strip():
+        return conversation.strip()
+    extended = message.get("extendedTextMessage")
+    if isinstance(extended, dict):
+        text = extended.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    for kind in ("imageMessage", "videoMessage", "documentMessage"):
+        media = message.get(kind)
+        if isinstance(media, dict):
+            caption = media.get("caption")
+            if isinstance(caption, str) and caption.strip():
+                return caption.strip()
+    return ""
+
+
+def _tipo_de_mensagem(item: dict) -> str:
+    declared = item.get("type")
+    if isinstance(declared, str) and declared:
+        return declared
+    message = item.get("message") if isinstance(item.get("message"), dict) else {}
+    if "imageMessage" in message or "stickerMessage" in message:
+        return "image"
+    if "audioMessage" in message or "pttMessage" in message:
+        return "audio"
+    if "videoMessage" in message:
+        return "video"
+    if "conversation" in message or "extendedTextMessage" in message:
+        return "text"
+    return "outro"
+
+
+def _nome_no_grupo(item: dict) -> str:
+    key = item.get("key") if isinstance(item.get("key"), dict) else {}
+    from_me = item.get("fromMe")
+    if from_me is None:
+        from_me = key.get("fromMe")
+    if from_me:
+        return "eu"
+    data = item.get("_data") if isinstance(item.get("_data"), dict) else {}
+    name = item.get("pushName") or data.get("pushName") or data.get("notify") or ""
+    name = str(name).strip()
+    if name and "@" not in name and not name.isdigit():
+        return name[:80]
+    return "participante"
+
+
+def summarize_group_messages(payload: object) -> dict:
+    rows = payload if isinstance(payload, list) else []
+    if isinstance(payload, dict):
+        nested = payload.get("messages")
+        rows = nested if isinstance(nested, list) else []
+    saidas = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("key") if isinstance(item.get("key"), dict) else {}
+        message_id = _waha_message_id(item) or _id_de(key.get("id"))
+        when = item.get("timestamp") or item.get("messageTimestamp")
+        saidas.append(
+            {
+                "id": id_publico(message_id),
+                "quando": when,
+                "de": _nome_no_grupo(item),
+                "tipo": _tipo_de_mensagem(item),
+                "texto": _texto_de_mensagem(item)[:4000],
+            }
+        )
+    saidas.sort(key=lambda row: row["quando"] or 0)
+    if len(saidas) > 40:
+        saidas = saidas[-40:]
+    result = {"data": saidas, "meta": {"count": len(saidas)}}
+    if not saidas:
+        result["aviso"] = "Ainda nao ha mensagens deste grupo na memoria. As que chegarem depois aparecem aqui."
+    return result
 
 
 def summarize_groups(payload: object) -> dict:
@@ -733,6 +826,8 @@ class Bridge:
             if not CHAT_ID_RE.match(group_id) or not group_id.endswith("@g.us"):
                 raise BridgeError(400, "Informe o id do grupo terminado em @g.us.")
             result = _group_brief(group_id, self.proxy("GET", "/v1/groups/" + group_id, "/v1/groups/" + group_id, b""))
+        elif name == "whatsapp_mensagens_grupo":
+            result = self.group_messages(str(arguments.get("id") or ""))
         elif name == "whatsapp_contatos":
             result = self._mcp_proxy("GET", "/v1/contacts/all")
         elif name == "whatsapp_etiquetas":
@@ -780,6 +875,23 @@ class Bridge:
             if exc.status < 500:
                 return {"error": {"message": exc.message}}
             raise
+
+    def group_messages(self, group_id: str) -> dict:
+        if not CHAT_ID_RE.match(group_id) or not group_id.endswith("@g.us"):
+            raise BridgeError(400, "Informe o id do grupo terminado em @g.us.")
+        path = (
+            "/api/"
+            + urllib.parse.quote(self.session, safe="")
+            + "/chats/"
+            + urllib.parse.quote(group_id, safe="")
+            + "/messages"
+        )
+        code, payload = self._waha("GET", path, query={"limit": "40", "downloadMedia": "false"})
+        if code == 404:
+            raise BridgeError(404, "Grupo nao encontrado.")
+        if code not in (200, 201):
+            raise BridgeError(502, "Nao foi possivel ler as mensagens deste grupo.")
+        return summarize_group_messages(payload)
 
     def session_status(self) -> dict:
         code, payload = self._waha("GET", f"/api/sessions/{self.session}")

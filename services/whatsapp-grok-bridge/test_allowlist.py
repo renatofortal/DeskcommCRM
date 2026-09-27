@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from server import (
@@ -15,6 +16,7 @@ from server import (
     mcp_message,
     mcp_tools,
     pkce_s256,
+    summarize_group_messages,
     summarize_groups,
 )
 
@@ -63,7 +65,7 @@ class McpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["result"]["serverInfo"]["name"], "whatsapp-assistente")
         status, listed = mcp_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, lambda name, arguments: "")
-        self.assertEqual(len(listed["result"]["tools"]), 11)
+        self.assertEqual(len(listed["result"]["tools"]), 12)
 
     def test_aviso_sem_corpo(self):
         status, payload = mcp_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, lambda name, arguments: "")
@@ -118,6 +120,19 @@ class ConfirmacaoTest(unittest.TestCase):
             [{"phone_number": "+5511999999999", "wa_lid": "123456789012345"}],
         )
         self.assertEqual(destino, "123456789012345@lid")
+
+    def test_mensagem_de_grupo_nao_leva_telefone(self):
+        bruto = {
+            "key": {"id": "3EB0ABCDEF1234567890", "fromMe": False, "remoteJid": "120363000000000000@g.us", "participant": "5511999999999@c.us"},
+            "messageTimestamp": 1700000000,
+            "pushName": "Ana",
+            "message": {"conversation": "bom dia"},
+        }
+        saida = summarize_group_messages([bruto])["data"][0]
+        self.assertEqual(saida["de"], "Ana")
+        self.assertEqual(saida["texto"], "bom dia")
+        self.assertEqual(saida["id"], "3EB0ABCDEF1234567890")
+        self.assertNotIn("5511", json.dumps(saida))
 
 
 class OAuthTest(unittest.TestCase):
