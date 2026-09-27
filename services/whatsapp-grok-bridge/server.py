@@ -95,12 +95,22 @@ def mcp_tools() -> list[dict]:
         },
         {
             "name": "whatsapp_mensagens",
-            "description": "Lista as 50 mensagens mais recentes. Audio usa whatsapp_audio com o id. Foto usa whatsapp_imagem com o id.",
+            "description": "Lista as 50 mensagens mais recentes, com confirmacao enviada, entregue ou lida. Audio usa whatsapp_audio. Foto usa whatsapp_imagem.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         },
         {
             "name": "whatsapp_audio",
             "description": "Ouve um audio do WhatsApp. Devolve a transcricao e o arquivo. O id e o da mensagem.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "whatsapp_confirmacao",
+            "description": "Diz se uma mensagem foi enviada, entregue no celular ou lida. O id e o da mensagem ou o id devolvido no envio.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string"}},
@@ -147,7 +157,8 @@ def mcp_tools() -> list[dict]:
             "name": "whatsapp_enviar_texto",
             "description": (
                 "Envia um texto por este WhatsApp somente quando a pessoa pediu nesta conversa. "
-                "Use to com DDI e DDD para pessoa, ou chat_id terminado em @c.us ou @g.us."
+                "Use to com DDI e DDD para pessoa, ou chat_id terminado em @c.us ou @g.us. "
+                "Depois chame whatsapp_confirmacao com o id devolvido para saber se foi entregue ou lida."
             ),
             "inputSchema": {
                 "type": "object",
@@ -487,6 +498,26 @@ def mcp_message(payload: object, invoke) -> tuple[int, dict | None]:
 
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+EXTERNAL_ID_RE = re.compile(r"^[A-Za-z0-9_.:@-]{6,160}$")
+BARE_ID_RE = re.compile(r"^[A-Za-z0-9]{8,64}$")
+
+
+def _receipt_filter(message_id: str) -> str:
+    message_id = message_id.strip()
+    parts: list[str] = []
+    if UUID_RE.match(message_id):
+        parts.append(f"id.eq.{message_id}")
+    if EXTERNAL_ID_RE.match(message_id):
+        encoded = urllib.parse.quote(message_id, safe="")
+        parts.append(f"external_id.eq.{encoded}")
+        bare = message_id.rsplit("_", 1)[-1]
+        if bare != message_id and BARE_ID_RE.match(bare):
+            parts.append(f"external_id.eq.{bare}")
+    if not parts:
+        raise BridgeError(400, "Informe o id da mensagem.")
+    if len(parts) == 1:
+        return parts[0]
+    return "or=(" + ",".join(parts) + ")"
 AUDIO_TYPES = {"audio", "ptt", "voice"}
 IMAGE_TYPES = {"image", "sticker"}
 MAX_AUDIO = 3 * 1024 * 1024
@@ -504,6 +535,55 @@ def image_blocks(summary: dict, image: bytes | None, mime: str) -> list:
     if image and mime.startswith("image/"):
         blocks.append({"type": "image", "data": base64.b64encode(image).decode("ascii"), "mimeType": mime.split(";")[0]})
     return blocks
+
+
+def _waha_message_id(result: object) -> object:
+    if not isinstance(result, dict):
+        return None
+    message_id = result.get("id")
+    if isinstance(message_id, dict):
+        return message_id.get("id") or message_id.get("_serialized")
+    return message_id
+
+
+def confirmacao_de(ack: object, status: object, delivered_at: object, read_at: object) -> dict:
+    labels = {
+        "failed": "falhou",
+        "sending": "enviando",
+        "sent": "enviada",
+        "delivered": "entregue",
+        "read": "lida",
+    }
+    try:
+        ack_n = int(ack) if ack is not None and ack != "" else None
+    except (TypeError, ValueError):
+        ack_n = None
+    by_ack = None
+    if ack_n is not None:
+        if ack_n < 0:
+            by_ack = "falhou"
+        elif ack_n >= 4:
+            by_ack = "ouvida"
+        elif ack_n >= 3:
+            by_ack = "lida"
+        elif ack_n >= 2:
+            by_ack = "entregue"
+        elif ack_n >= 1:
+            by_ack = "enviada"
+        else:
+            by_ack = "enviando"
+    by_status = labels.get(str(status or "").lower())
+    rank = {"falhou": 5, "ouvida": 4, "lida": 3, "entregue": 2, "enviada": 1, "enviando": 0}
+    chosen = by_status or by_ack or "enviando"
+    if by_ack and rank.get(by_ack, 0) > rank.get(chosen, 0):
+        chosen = by_ack
+    if by_status == "falhou" or by_ack == "falhou":
+        chosen = "falhou"
+    return {
+        "confirmacao": chosen,
+        "entregue_em": delivered_at or None,
+        "lida_em": read_at or None,
+    }
 
 
 def audio_blocks(summary: dict, audio: bytes | None, mime: str) -> list:
@@ -588,6 +668,8 @@ class Bridge:
             return self.audio_message(str(arguments.get("id") or ""))
         elif name == "whatsapp_imagem":
             return self.image_message(str(arguments.get("id") or ""))
+        elif name == "whatsapp_confirmacao":
+            result = self.message_receipt(str(arguments.get("id") or ""))
         elif name == "whatsapp_grupos":
             result = summarize_groups(self.proxy("GET", "/v1/groups", "/v1/groups", b""))
         elif name == "whatsapp_grupo":
@@ -612,7 +694,14 @@ class Bridge:
                     raise BridgeError(403, "Envio recusado pela chave da sessao.")
                 if code not in (200, 201):
                     raise BridgeError(502, "O WhatsApp nao aceitou o envio.")
-                result = {"data": {"chat_id": chat_id}}
+                result = {
+                    "data": {
+                        "id": _waha_message_id(sent),
+                        "chat_id": chat_id,
+                        "confirmacao": "enviada",
+                        "aviso": "Consulte whatsapp_confirmacao com este id para saber se foi entregue ou lida.",
+                    }
+                }
             else:
                 result = self.send_text(json.dumps({"to": arguments.get("to") or "", "text": text}).encode("utf-8"))
         elif name == "whatsapp_status":
@@ -652,7 +741,7 @@ class Bridge:
     def list_messages(self) -> dict:
         channel_id, org_id = self._channel_ids()
         query = (
-            "messages?select=id,sent_at,direction,sent_via,type,body,media_derived_text,"
+            "messages?select=id,sent_at,direction,sent_via,type,body,media_derived_text,ack,status,delivered_at,read_at,"
             "contacts(display_name,phone_number)"
             f"&channel_session_id=eq.{channel_id}"
             f"&organization_id=eq.{org_id}"
@@ -675,11 +764,45 @@ class Bridge:
                     "type": row.get("type"),
                     "body": row.get("body") or "",
                     "transcricao": row.get("media_derived_text") or "",
+                    **confirmacao_de(row.get("ack"), row.get("status"), row.get("delivered_at"), row.get("read_at")),
                     "contact_name": contact.get("display_name") or "",
                     "contact_phone": contact.get("phone_number") or "",
                 }
             )
         return {"data": data, "meta": {"count": len(data)}}
+
+    def message_receipt(self, message_id: str) -> dict:
+        channel_id, org_id = self._channel_ids()
+        lookup = _receipt_filter(message_id)
+        query = (
+            "messages?select=id,external_id,sent_at,direction,type,ack,status,delivered_at,read_at,"
+            "contacts(display_name,phone_number)"
+            f"&channel_session_id=eq.{channel_id}"
+            f"&organization_id=eq.{org_id}"
+            f"&{lookup}"
+            "&order=sent_at.desc&limit=1"
+        )
+        rows = self._supabase(query)
+        if not rows:
+            raise BridgeError(404, "Mensagem nao encontrada neste WhatsApp. Se acabou de enviar, espere alguns segundos e consulte de novo.")
+        row = rows[0]
+        contact = row.get("contacts")
+        if isinstance(contact, list):
+            contact = contact[0] if contact else {}
+        if not isinstance(contact, dict):
+            contact = {}
+        return {
+            "data": {
+                "id": row.get("id"),
+                "external_id": row.get("external_id"),
+                "sent_at": row.get("sent_at"),
+                "direction": row.get("direction"),
+                "type": row.get("type"),
+                "contato": contact.get("display_name") or "",
+                "telefone": mask_phone(str(contact.get("phone_number") or "")),
+                **confirmacao_de(row.get("ack"), row.get("status"), row.get("delivered_at"), row.get("read_at")),
+            }
+        }
 
     def audio_message(self, message_id: str) -> list:
         if not UUID_RE.match(message_id):
@@ -801,10 +924,15 @@ class Bridge:
             raise BridgeError(403, "Envio recusado pela chave da sessao.")
         if code not in (200, 201) or not isinstance(result, dict):
             raise BridgeError(502, "O WhatsApp nao aceitou o envio.")
-        message_id = result.get("id")
-        if isinstance(message_id, dict):
-            message_id = message_id.get("id") or message_id.get("_serialized")
-        return {"data": {"id": message_id, "to": mask_phone(phone)}}
+        message_id = _waha_message_id(result)
+        return {
+            "data": {
+                "id": message_id,
+                "to": mask_phone(phone),
+                "confirmacao": "enviada",
+                "aviso": "Consulte whatsapp_confirmacao com este id para saber se foi entregue ou lida.",
+            }
+        }
 
     def proxy(self, method: str, path: str, target: str, raw: bytes) -> object:
         if len(raw) > MAX_BODY:

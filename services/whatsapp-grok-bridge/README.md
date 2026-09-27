@@ -70,7 +70,7 @@ curl.exe -s -H "Authorization: Bearer <BRIDGE_TOKEN>" http://127.0.0.1:3011/v1/m
 curl.exe -s -H "Authorization: Bearer <BRIDGE_TOKEN>" http://127.0.0.1:3011/v1/session
 ```
 
-A lista traz no máximo as 50 mensagens mais recentes. Para ouvir um áudio, use `whatsapp_audio` com o id da mensagem. Para ver uma foto ou um print, use `whatsapp_imagem` com o id.
+A lista traz no máximo as 50 mensagens mais recentes, com `confirmacao` (`enviada`, `entregue`, `lida` ou `ouvida`). Para uma mensagem específica, use `whatsapp_confirmacao` com o id. Para ouvir um áudio, use `whatsapp_audio`. Para ver uma foto, use `whatsapp_imagem`.
 
 ## Grupos, contatos, etiquetas e status
 

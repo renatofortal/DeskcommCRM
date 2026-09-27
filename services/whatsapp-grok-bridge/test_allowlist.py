@@ -1,6 +1,18 @@
 import unittest
 
-from server import OAuthDesk, PHONE_RE, audio_blocks, image_blocks, is_allowed, mask_phone, mcp_message, mcp_tools, pkce_s256, summarize_groups
+from server import (
+    OAuthDesk,
+    PHONE_RE,
+    audio_blocks,
+    confirmacao_de,
+    image_blocks,
+    is_allowed,
+    mask_phone,
+    mcp_message,
+    mcp_tools,
+    pkce_s256,
+    summarize_groups,
+)
 
 
 class AllowlistTest(unittest.TestCase):
@@ -47,7 +59,7 @@ class McpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["result"]["serverInfo"]["name"], "whatsapp-assistente")
         status, listed = mcp_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, lambda name, arguments: "")
-        self.assertEqual(len(listed["result"]["tools"]), 10)
+        self.assertEqual(len(listed["result"]["tools"]), 11)
 
     def test_aviso_sem_corpo(self):
         status, payload = mcp_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, lambda name, arguments: "")
@@ -81,6 +93,15 @@ class McpTest(unittest.TestCase):
         self.assertEqual(blocks[1]["type"], "image")
         self.assertEqual(blocks[1]["mimeType"], "image/jpeg")
         self.assertNotIn("jpg", blocks[0]["text"])
+
+
+class ConfirmacaoTest(unittest.TestCase):
+    def test_entregue_e_lida(self):
+        self.assertEqual(confirmacao_de(2, "delivered", "2026-09-27T00:00:00Z", None)["confirmacao"], "entregue")
+        self.assertEqual(confirmacao_de(3, "read", "2026-09-27T00:00:00Z", "2026-09-27T00:01:00Z")["confirmacao"], "lida")
+        self.assertEqual(confirmacao_de(4, "read", None, None)["confirmacao"], "ouvida")
+        self.assertEqual(confirmacao_de(1, "sent", None, None)["confirmacao"], "enviada")
+        self.assertEqual(confirmacao_de(-1, "failed", None, None)["confirmacao"], "falhou")
 
 
 class OAuthTest(unittest.TestCase):
