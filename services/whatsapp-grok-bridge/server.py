@@ -187,20 +187,51 @@ CODE_TTL_S = 120
 TOKEN_TTL_S = 90 * 24 * 60 * 60
 
 
+PUBLIC_BASE = "https://crm.verticesales.com.br"
+CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+
+
 def oauth_kind(path: str) -> str | None:
     clean = _clean_path(path)
-    for suffix, kind in (("/oauth/authorize", "authorize"), ("/oauth/token", "token")):
+    for suffix, kind in (
+        ("/oauth/authorize", "authorize"),
+        ("/oauth/token", "token"),
+        ("/oauth/register", "register"),
+    ):
         if clean == suffix or clean.endswith(suffix):
             return kind
+    return None
+
+
+def discovery_kind(path: str) -> str | None:
+    clean = _clean_path(path)
+    if clean in (
+        "/.well-known/oauth-authorization-server/wa-assistente",
+        "/wa-assistente/.well-known/oauth-authorization-server",
+    ):
+        return "authorization-server"
+    if clean in (
+        "/.well-known/oauth-protected-resource/wa-assistente/mcp",
+        "/wa-assistente/oauth-protected-resource",
+    ):
+        return "protected-resource"
     return None
 
 
 def redirect_allowed(url: str) -> bool:
     parts = urllib.parse.urlsplit(url)
     host = (parts.hostname or "").lower()
+    if parts.scheme == "cursor" and host == "anysphere.cursor-mcp" and parts.path.startswith("/oauth/callback"):
+        return True
+    if parts.scheme == "http" and host in ("localhost", "127.0.0.1") and parts.path.rstrip("/") == "/callback":
+        return True
     if parts.scheme != "https" or not host:
         return False
-    return host == "grok.com" or host.endswith(".grok.com") or host == "x.ai" or host.endswith(".x.ai")
+    return any(host == name or host.endswith("." + name) for name in ("grok.com", "x.ai", "cursor.com"))
+
+
+def client_id_ok(value: str | None) -> bool:
+    return not value or bool(CLIENT_ID_RE.match(value))
 
 
 def pkce_s256(verifier: str) -> str:
@@ -211,7 +242,7 @@ def pkce_s256(verifier: str) -> str:
 class OAuthDesk:
     def __init__(self, token: str):
         self.token = token
-        self._codes: dict[str, tuple[float, str, str]] = {}
+        self._codes: dict[str, tuple[float, str, str, str]] = {}
         self._lock = threading.Lock()
 
     def page(self, query: dict[str, str]) -> tuple[int, str]:
@@ -230,7 +261,7 @@ class OAuthDesk:
         code = secrets.token_urlsafe(32)
         with self._lock:
             self._drop_expired()
-            self._codes[code] = (time.time() + CODE_TTL_S, form["code_challenge"], form["redirect_uri"])
+            self._codes[code] = (time.time() + CODE_TTL_S, form["code_challenge"], form["redirect_uri"], form.get("client_id") or "")
         target = urllib.parse.urlsplit(form["redirect_uri"])
         params = dict(urllib.parse.parse_qsl(target.query, keep_blank_values=True))
         params["code"] = code
@@ -241,7 +272,7 @@ class OAuthDesk:
 
     def exchange(self, form: dict[str, str]) -> tuple[int, dict]:
         grant = form.get("grant_type") or ""
-        if form.get("client_id") not in ("", OAUTH_CLIENT_ID):
+        if not client_id_ok(form.get("client_id")):
             return 400, {"error": "invalid_client"}
         if grant == "refresh_token":
             if not _refresh_ok(self.token, form.get("refresh_token") or ""):
@@ -256,7 +287,9 @@ class OAuthDesk:
             saved = self._codes.pop(code, None)
         if not saved:
             return 400, {"error": "invalid_grant"}
-        _expires, challenge, redirect = saved
+        _expires, challenge, redirect, saved_client = saved
+        if saved_client and form.get("client_id") and form.get("client_id") != saved_client:
+            return 400, {"error": "invalid_client"}
         if form.get("redirect_uri") and form.get("redirect_uri") != redirect:
             return 400, {"error": "invalid_grant"}
         try:
@@ -268,8 +301,8 @@ class OAuthDesk:
         return 200, _token_body(self.token)
 
     def _request_error(self, query: dict[str, str]) -> str | None:
-        if query.get("client_id") not in ("", OAUTH_CLIENT_ID):
-            return "O ID do cliente tem de ser grok."
+        if not client_id_ok(query.get("client_id")):
+            return "O ID do cliente nao serve."
         if query.get("response_type") not in ("", "code"):
             return "O Grok precisa pedir o codigo de autorizacao."
         if query.get("code_challenge_method") not in ("", "S256"):
@@ -279,6 +312,20 @@ class OAuthDesk:
         if not redirect_allowed(query.get("redirect_uri") or ""):
             return "O retorno precisa ser um endereco https do Grok."
         return None
+
+    def register(self, body: dict) -> tuple[int, dict]:
+        uris = body.get("redirect_uris")
+        if not isinstance(uris, list) or not uris:
+            return 400, {"error": "invalid_redirect_uri"}
+        if not all(isinstance(item, str) and redirect_allowed(item) for item in uris):
+            return 400, {"error": "invalid_redirect_uri"}
+        return 201, {
+            "client_id": secrets.token_urlsafe(16),
+            "redirect_uris": uris,
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+        }
 
     def _drop_expired(self) -> None:
         now = time.time()
@@ -303,6 +350,26 @@ def _token_body(token: str) -> dict:
         "token_type": "Bearer",
         "expires_in": TOKEN_TTL_S,
         "refresh_token": f"{exp}.{sig}",
+    }
+
+
+def discovery_document(kind: str) -> dict:
+    issuer = PUBLIC_BASE + "/wa-assistente"
+    if kind == "protected-resource":
+        return {
+            "resource": issuer + "/mcp",
+            "authorization_servers": [issuer],
+            "bearer_methods_supported": ["header"],
+        }
+    return {
+        "issuer": issuer,
+        "authorization_endpoint": issuer + "/oauth/authorize",
+        "token_endpoint": issuer + "/oauth/token",
+        "registration_endpoint": issuer + "/oauth/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
     }
 
 
@@ -720,7 +787,23 @@ def make_handler(bridge: Bridge):
                 self._send(413, {"error": {"message": "Pedido grande demais."}})
                 return
             raw = self.rfile.read(length) if length else b""
+            found = discovery_kind(self.path)
+            if found and self.command == "GET":
+                self._send(200, discovery_document(found))
+                return
             kind = oauth_kind(self.path)
+            if kind == "register" and self.command == "POST":
+                form = _form_dict(raw, self.headers.get("Content-Type"))
+                if self.headers.get("Content-Type") and "application/json" in self.headers.get("Content-Type", ""):
+                    try:
+                        parsed = json.loads(raw.decode("utf-8") or "{}")
+                    except json.JSONDecodeError:
+                        parsed = {}
+                else:
+                    parsed = form
+                status, payload = bridge.oauth.register(parsed if isinstance(parsed, dict) else {})
+                self._send(status, payload)
+                return
             if kind == "authorize" and self.command == "GET":
                 query = {key: value for key, value in urllib.parse.parse_qsl(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)}
                 status, page = bridge.oauth.page(query)
@@ -782,7 +865,12 @@ def make_handler(bridge: Bridge):
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             if status == 401:
-                self.send_header("WWW-Authenticate", 'Bearer realm="whatsapp"')
+                self.send_header(
+                    "WWW-Authenticate",
+                    'Bearer realm="whatsapp", resource_metadata="'
+                    + PUBLIC_BASE
+                    + '/.well-known/oauth-protected-resource/wa-assistente/mcp"',
+                )
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)

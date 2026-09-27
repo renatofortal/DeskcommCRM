@@ -80,6 +80,14 @@ class OAuthTest(unittest.TestCase):
             "state": "abc",
         }
 
+    def test_aceita_retorno_do_aplicativo(self):
+        desk = OAuthDesk("token-de-teste")
+        status, page = desk.page(self._query(pkce_s256("verificador-valido-123456"), "https://www.cursor.com/agents/mcp/oauth/callback"))
+        self.assertEqual(status, 200)
+        self.assertIn("Conectar", page)
+        status, page = desk.page(self._query(pkce_s256("verificador-valido-123456"), "http://127.0.0.1:8787/callback"))
+        self.assertEqual(status, 200)
+
     def test_recusa_retorno_fora_do_grok(self):
         desk = OAuthDesk("token-de-teste")
         status, page = desk.page(self._query(pkce_s256("verificador-valido-123456"), "https://example.com/callback"))
