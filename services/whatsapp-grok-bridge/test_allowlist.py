@@ -1,6 +1,6 @@
 import unittest
 
-from server import OAuthDesk, PHONE_RE, audio_blocks, is_allowed, mask_phone, mcp_message, mcp_tools, pkce_s256, summarize_groups
+from server import OAuthDesk, PHONE_RE, audio_blocks, image_blocks, is_allowed, mask_phone, mcp_message, mcp_tools, pkce_s256, summarize_groups
 
 
 class AllowlistTest(unittest.TestCase):
@@ -47,7 +47,7 @@ class McpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["result"]["serverInfo"]["name"], "whatsapp-assistente")
         status, listed = mcp_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, lambda name, arguments: "")
-        self.assertEqual(len(listed["result"]["tools"]), 9)
+        self.assertEqual(len(listed["result"]["tools"]), 10)
 
     def test_aviso_sem_corpo(self):
         status, payload = mcp_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, lambda name, arguments: "")
@@ -75,6 +75,12 @@ class McpTest(unittest.TestCase):
         self.assertEqual(blocks[1]["type"], "audio")
         self.assertEqual(blocks[1]["mimeType"], "audio/ogg")
         self.assertNotIn("abc", blocks[0]["text"])
+
+    def test_imagem_leva_arquivo(self):
+        blocks = image_blocks({"legenda": "print"}, b"jpg", "image/jpeg")
+        self.assertEqual(blocks[1]["type"], "image")
+        self.assertEqual(blocks[1]["mimeType"], "image/jpeg")
+        self.assertNotIn("jpg", blocks[0]["text"])
 
 
 class OAuthTest(unittest.TestCase):

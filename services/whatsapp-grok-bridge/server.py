@@ -95,12 +95,22 @@ def mcp_tools() -> list[dict]:
         },
         {
             "name": "whatsapp_mensagens",
-            "description": "Lista as 50 mensagens mais recentes. Audio ja transcrito vem no campo transcricao. Para ouvir o arquivo, use whatsapp_audio com o id.",
+            "description": "Lista as 50 mensagens mais recentes. Audio usa whatsapp_audio com o id. Foto usa whatsapp_imagem com o id.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         },
         {
             "name": "whatsapp_audio",
             "description": "Ouve um audio do WhatsApp. Devolve a transcricao e o arquivo. O id e o da mensagem.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "whatsapp_imagem",
+            "description": "Ve uma imagem do WhatsApp. Devolve o arquivo da foto ou do print. O id e o da mensagem.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string"}},
@@ -478,13 +488,22 @@ def mcp_message(payload: object, invoke) -> tuple[int, dict | None]:
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 AUDIO_TYPES = {"audio", "ptt", "voice"}
+IMAGE_TYPES = {"image", "sticker"}
 MAX_AUDIO = 3 * 1024 * 1024
+MAX_IMAGE = 4 * 1024 * 1024
 
 
 def _as_content(value: object) -> list:
     if isinstance(value, list):
         return value
     return [{"type": "text", "text": str(value)}]
+
+
+def image_blocks(summary: dict, image: bytes | None, mime: str) -> list:
+    blocks: list = [{"type": "text", "text": json.dumps(summary, ensure_ascii=False)}]
+    if image and mime.startswith("image/"):
+        blocks.append({"type": "image", "data": base64.b64encode(image).decode("ascii"), "mimeType": mime.split(";")[0]})
+    return blocks
 
 
 def audio_blocks(summary: dict, audio: bytes | None, mime: str) -> list:
@@ -567,6 +586,8 @@ class Bridge:
             result = self.list_messages()
         elif name == "whatsapp_audio":
             return self.audio_message(str(arguments.get("id") or ""))
+        elif name == "whatsapp_imagem":
+            return self.image_message(str(arguments.get("id") or ""))
         elif name == "whatsapp_grupos":
             result = summarize_groups(self.proxy("GET", "/v1/groups", "/v1/groups", b""))
         elif name == "whatsapp_grupo":
@@ -693,14 +714,52 @@ class Bridge:
             "transcricao": row.get("media_derived_text") or "",
             "transcricao_status": row.get("media_derived_status") or "",
         }
-        audio = self._download_audio(str(row.get("media_storage_path") or ""))
+        audio = self._download_media(str(row.get("media_storage_path") or ""), MAX_AUDIO)
         if audio is None and not summary["transcricao"]:
             summary["aviso"] = "O arquivo de audio nao esta guardado."
         elif audio is None:
             summary["aviso"] = "A transcricao esta pronta. O arquivo passou do tamanho que o conector envia."
         return audio_blocks(summary, audio, mime if mime.startswith("audio/") else "audio/ogg")
 
-    def _download_audio(self, path: str) -> bytes | None:
+    def image_message(self, message_id: str) -> list:
+        if not UUID_RE.match(message_id):
+            raise BridgeError(400, "Informe o id da mensagem.")
+        channel_id, org_id = self._channel_ids()
+        query = (
+            "messages?select=id,type,sent_at,body,media_mime,media_derived_text,media_storage_path,"
+            "contacts(display_name,phone_number)"
+            f"&id=eq.{message_id}"
+            f"&channel_session_id=eq.{channel_id}"
+            f"&organization_id=eq.{org_id}"
+            "&limit=1"
+        )
+        rows = self._supabase(query)
+        if not rows:
+            raise BridgeError(404, "Imagem nao encontrada neste WhatsApp.")
+        row = rows[0]
+        kind = str(row.get("type") or "")
+        mime = str(row.get("media_mime") or "image/jpeg")
+        if kind not in IMAGE_TYPES and not mime.startswith("image/"):
+            raise BridgeError(400, "Essa mensagem nao e uma imagem.")
+        contact = row.get("contacts")
+        if isinstance(contact, list):
+            contact = contact[0] if contact else {}
+        if not isinstance(contact, dict):
+            contact = {}
+        summary = {
+            "id": row.get("id"),
+            "sent_at": row.get("sent_at"),
+            "contato": contact.get("display_name") or "",
+            "telefone": mask_phone(str(contact.get("phone_number") or "")),
+            "legenda": row.get("body") or "",
+            "descricao": row.get("media_derived_text") or "",
+        }
+        image = self._download_media(str(row.get("media_storage_path") or ""), MAX_IMAGE)
+        if image is None:
+            summary["aviso"] = "O arquivo da imagem nao esta guardado ou passou do tamanho que o conector envia."
+        return image_blocks(summary, image, mime if mime.startswith("image/") else "image/jpeg")
+
+    def _download_media(self, path: str, limit: int) -> bytes | None:
         if not path or ".." in path or path.startswith("/"):
             return None
         url = self.supabase + "/storage/v1/object/whatsapp-media/" + urllib.parse.quote(path, safe="/")
@@ -709,12 +768,12 @@ class Bridge:
         req.add_header("Authorization", "Bearer " + self.service_role)
         try:
             with urllib.request.urlopen(req, timeout=30) as response:
-                data = response.read(MAX_AUDIO + 1)
+                data = response.read(limit + 1)
         except urllib.error.HTTPError:
             return None
         except urllib.error.URLError:
             return None
-        if len(data) > MAX_AUDIO:
+        if len(data) > limit:
             return None
         return data
 
