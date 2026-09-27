@@ -76,6 +76,8 @@ Envio para uma pessoa que já conversou sai pelo identificador em que o WhatsApp
 
 Todos os grupos deste WhatsApp entram na memória. `whatsapp_mensagens_grupo` lê as mensagens recentes de qualquer um deles, pelo id terminado em `@g.us`.
 
+Para marcar alguém num grupo, o envio leva `mentions` com o telefone. O conector coloca a marcação de verdade, e a confirmação também acha mensagem enviada em grupo.
+
 A lista traz no máximo as 50 mensagens mais recentes, com `confirmacao` (`enviada`, `entregue`, `lida` ou `ouvida`). Para uma mensagem específica, use `whatsapp_confirmacao` com o id. Para ouvir um áudio, use `whatsapp_audio`. Para ver uma foto, use `whatsapp_imagem`.
 
 ## Grupos, contatos, etiquetas e status

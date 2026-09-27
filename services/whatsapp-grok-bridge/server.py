@@ -110,7 +110,7 @@ def mcp_tools() -> list[dict]:
         },
         {
             "name": "whatsapp_confirmacao",
-            "description": "Diz se uma mensagem foi enviada, entregue no celular ou lida. O id e o da mensagem ou o id devolvido no envio.",
+            "description": "Diz se uma mensagem foi enviada, entregue no celular ou lida. Vale para conversa individual e para grupo. O id e o da mensagem ou o id devolvido no envio.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string"}},
@@ -168,6 +168,7 @@ def mcp_tools() -> list[dict]:
             "description": (
                 "Envia um texto por este WhatsApp somente quando a pessoa pediu nesta conversa. "
                 "Use to com DDI e DDD para pessoa, ou chat_id terminado em @c.us ou @g.us. "
+                "Para marcar alguem no grupo, passe mentions com o telefone de cada pessoa. "
                 "Depois chame whatsapp_confirmacao com o id devolvido para saber se foi entregue ou lida."
             ),
             "inputSchema": {
@@ -176,6 +177,7 @@ def mcp_tools() -> list[dict]:
                     "to": {"type": "string"},
                     "chat_id": {"type": "string"},
                     "text": {"type": "string"},
+                    "mentions": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["text"],
                 "additionalProperties": False,
@@ -667,11 +669,53 @@ def id_publico(message_id: object) -> str | None:
     text = message_id.strip()
     if not text:
         return None
+    if "@g.us" in text:
+        return text
     if "@" in text:
         bare = text.rsplit("_", 1)[-1]
         if BARE_ID_RE.match(bare):
             return bare
     return text
+
+
+_MENCAO_NO_TEXTO = re.compile(r"@[0-9]{8,20}")
+
+
+def aplicar_marcacoes(text: str, jids: list[str]) -> tuple[str, list[str]]:
+    if any(jid == "all" for jid in jids):
+        return text, ["all"]
+    escolhidos: list[str] = []
+    for jid in jids:
+        if CHAT_ID_RE.match(jid) and jid not in escolhidos:
+            escolhidos.append(jid)
+    escolhidos = escolhidos[:15]
+    for jid in escolhidos:
+        token = "@" + jid.split("@", 1)[0]
+        if token in text:
+            continue
+        if _MENCAO_NO_TEXTO.search(text):
+            text = _MENCAO_NO_TEXTO.sub(token, text, count=1)
+        else:
+            text = (text.rstrip() + " " + token).strip()
+    return text, escolhidos
+
+
+def referencia_de_grupo(message_id: str) -> tuple[str, list[str]] | None:
+    text = message_id.strip()
+    if "@g.us" not in text:
+        return None
+    first = text.find("_")
+    last = text.rfind("_")
+    if first == -1 or last <= first:
+        return None
+    chat = text[first + 1:last]
+    if not chat.endswith("@g.us") or not CHAT_ID_RE.match(chat):
+        return None
+    bare = text[last + 1:]
+    ids = [text]
+    if bare and bare != text:
+        ids.append(bare)
+    return chat, ids
 
 
 def _mesmo_telefone(pedido: str, gravado: str) -> bool:
@@ -842,20 +886,10 @@ class Bridge:
                     raise BridgeError(400, "Informe text com ate 4000 caracteres.")
                 if chat_id.endswith("@c.us"):
                     chat_id = self._chat_de_telefone(chat_id.split("@", 1)[0])
-                code, sent = self._waha("POST", "/api/sendText", {"session": self.session, "chatId": chat_id, "text": text})
-                if code == 403:
-                    raise BridgeError(403, "Envio recusado pela chave da sessao.")
-                if code not in (200, 201):
-                    raise BridgeError(502, "O WhatsApp nao aceitou o envio.")
-                result = {
-                    "data": {
-                        "id": id_publico(_waha_message_id(sent)),
-                        "confirmacao": "enviada",
-                        "aviso": "Consulte whatsapp_confirmacao com este id para saber se foi entregue ou lida.",
-                    }
-                }
+                result = self._enviar_texto(chat_id, text, self._jids_de_marcacao(arguments.get("mentions")))
             else:
-                result = self.send_text(json.dumps({"to": arguments.get("to") or "", "text": text}).encode("utf-8"))
+                bruto = {"to": arguments.get("to") or "", "text": text, "mentions": arguments.get("mentions") or []}
+                result = self.send_text(json.dumps(bruto).encode("utf-8"))
         elif name == "whatsapp_status":
             text = str(arguments.get("text") or "").strip()
             if not text:
@@ -953,6 +987,9 @@ class Bridge:
         )
         rows = self._supabase(query)
         if not rows:
+            grupo = self._recibo_de_grupo(message_id)
+            if grupo:
+                return grupo
             raise BridgeError(404, "Mensagem nao encontrada neste WhatsApp. Se acabou de enviar, espere alguns segundos e consulte de novo.")
         row = rows[0]
         contact = row.get("contacts")
@@ -1104,24 +1141,77 @@ class Bridge:
             raise BridgeError(400, "Informe o numero em to, com DDI e DDD, sem texto extra.")
         if not text or len(text) > 4000:
             raise BridgeError(400, "Informe text com ate 4000 caracteres.")
-        code, result = self._waha(
-            "POST",
-            "/api/sendText",
-            {"session": self.session, "chatId": self._chat_de_telefone(phone), "text": text},
-        )
+        sent = self._enviar_texto(self._chat_de_telefone(phone), text, self._jids_de_marcacao(payload.get("mentions")))
+        sent["data"]["to"] = mask_phone(phone)
+        return sent
+
+    def _jids_de_marcacao(self, mentions: object) -> list[str]:
+        if not isinstance(mentions, list):
+            return []
+        saida: list[str] = []
+        for item in mentions[:15]:
+            bruto = str(item or "").strip()
+            if bruto == "all":
+                return ["all"]
+            if CHAT_ID_RE.match(bruto):
+                saida.append(bruto)
+                continue
+            digits = re.sub(r"\D", "", bruto)
+            if PHONE_RE.match(digits):
+                saida.append(self._chat_de_telefone(digits))
+        return saida
+
+    def _enviar_texto(self, chat_id: str, text: str, mentions: list[str]) -> dict:
+        text, mentions = aplicar_marcacoes(text, mentions)
+        if not text or len(text) > 4000:
+            raise BridgeError(400, "Informe text com ate 4000 caracteres.")
+        body: dict = {"session": self.session, "chatId": chat_id, "text": text}
+        if mentions:
+            body["mentions"] = mentions
+        code, result = self._waha("POST", "/api/sendText", body)
         if code == 403:
             raise BridgeError(403, "Envio recusado pela chave da sessao.")
         if code not in (200, 201) or not isinstance(result, dict):
             raise BridgeError(502, "O WhatsApp nao aceitou o envio.")
-        message_id = id_publico(_waha_message_id(result))
         return {
             "data": {
-                "id": message_id,
-                "to": mask_phone(phone),
+                "id": id_publico(_waha_message_id(result)),
                 "confirmacao": "enviada",
+                "marcacoes": len(mentions),
                 "aviso": "Consulte whatsapp_confirmacao com este id para saber se foi entregue ou lida.",
             }
         }
+
+    def _recibo_de_grupo(self, message_id: str) -> dict | None:
+        ref = referencia_de_grupo(message_id)
+        if not ref:
+            return None
+        chat, ids = ref
+        for mid in ids:
+            path = (
+                "/api/"
+                + urllib.parse.quote(self.session, safe="")
+                + "/chats/"
+                + urllib.parse.quote(chat, safe="")
+                + "/messages/"
+                + urllib.parse.quote(mid, safe="")
+            )
+            code, payload = self._waha("GET", path)
+            if code != 200 or not isinstance(payload, dict) or not payload:
+                continue
+            when = payload.get("timestamp") or payload.get("messageTimestamp")
+            return {
+                "data": {
+                    "id": id_publico(str(payload.get("id") or message_id)),
+                    "id_whatsapp": id_publico(str(payload.get("id") or message_id)),
+                    "sent_at": when,
+                    "direction": "outbound" if payload.get("fromMe") else "inbound",
+                    "type": payload.get("type") or "text",
+                    "contato": "grupo",
+                    **confirmacao_de(payload.get("ack"), None, None, None),
+                }
+            }
+        return None
 
     def proxy(self, method: str, path: str, target: str, raw: bytes) -> object:
         if len(raw) > MAX_BODY:

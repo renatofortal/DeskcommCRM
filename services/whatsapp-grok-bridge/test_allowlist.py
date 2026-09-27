@@ -6,6 +6,8 @@ from server import (
     PHONE_RE,
     _receipt_filter,
     _waha_message_id,
+    aplicar_marcacoes,
+    referencia_de_grupo,
     audio_blocks,
     chat_id_com_lid,
     confirmacao_de,
@@ -133,6 +135,17 @@ class ConfirmacaoTest(unittest.TestCase):
         self.assertEqual(saida["texto"], "bom dia")
         self.assertEqual(saida["id"], "3EB0ABCDEF1234567890")
         self.assertNotIn("5511", json.dumps(saida))
+
+    def test_marcacao_vira_jid_e_grupo_guarda_o_id(self):
+        texto, jids = aplicar_marcacoes("oi @5511999999999", ["123456789012345@lid"])
+        self.assertEqual(jids, ["123456789012345@lid"])
+        self.assertIn("@123456789012345", texto)
+        self.assertNotIn("@5511999999999", texto)
+        composto = "true_120363000000000000@g.us_3EB0ABCDEF1234567890"
+        self.assertEqual(id_publico(composto), composto)
+        chat, ids = referencia_de_grupo(composto)
+        self.assertEqual(chat, "120363000000000000@g.us")
+        self.assertEqual(ids[0], composto)
 
 
 class OAuthTest(unittest.TestCase):
