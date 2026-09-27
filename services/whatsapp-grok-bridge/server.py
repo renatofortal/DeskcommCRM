@@ -110,7 +110,7 @@ def mcp_tools() -> list[dict]:
         },
         {
             "name": "whatsapp_confirmacao",
-            "description": "Diz se uma mensagem foi enviada, entregue no celular ou lida. Vale para conversa individual e para grupo. O id e o da mensagem ou o id devolvido no envio.",
+            "description": "Diz se uma mensagem foi enviada, entregue no celular ou lida. Vale para conversa individual e para grupo, com o id curto ou o id completo devolvido no envio. No grupo, entregue_para e lida_por contam participantes e nao dizem quem.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string"}},
@@ -777,6 +777,54 @@ def confirmacao_de(ack: object, status: object, delivered_at: object, read_at: o
     }
 
 
+def confirmacao_de_grupo(payload: dict) -> dict:
+    """No grupo o aviso geral fica em zero. A entrega e a leitura ficam por participante."""
+    data = payload.get("_data") if isinstance(payload.get("_data"), dict) else {}
+    receipts = data.get("userReceipt")
+    if not isinstance(receipts, list):
+        receipts = []
+    lidas = 0
+    entregues = 0
+    for row in receipts:
+        if not isinstance(row, dict):
+            continue
+        leu = bool(row.get("readTimestamp") or row.get("playedTimestamp"))
+        recebeu = bool(row.get("receiptTimestamp")) or leu
+        if leu:
+            lidas += 1
+        if recebeu:
+            entregues += 1
+    ack = payload.get("ack")
+    if lidas:
+        ack = 3
+    elif entregues:
+        ack = 2
+    elif ack in (0, None, "", "0"):
+        ack = 1
+    base = confirmacao_de(ack, None, None, None)
+    if entregues or lidas:
+        base["entregue_para"] = entregues
+        base["lida_por"] = lidas
+    return base
+
+
+def id_de_envio(chat_id: str, message_id: str | None) -> str | None:
+    if not message_id:
+        return None
+    if chat_id.endswith("@g.us") and "@g.us" not in message_id:
+        bare = message_id.rsplit("_", 1)[-1]
+        return f"true_{chat_id}_{bare}"
+    return id_publico(message_id)
+
+
+def id_bate(pedido: str, candidato: str) -> bool:
+    if not candidato:
+        return False
+    if candidato == pedido:
+        return True
+    return "@g.us" in candidato and candidato.endswith("_" + pedido)
+
+
 def audio_blocks(summary: dict, audio: bytes | None, mime: str) -> list:
     blocks: list = [{"type": "text", "text": json.dumps(summary, ensure_ascii=False)}]
     if audio and mime.startswith("audio/"):
@@ -1175,7 +1223,7 @@ class Bridge:
             raise BridgeError(502, "O WhatsApp nao aceitou o envio.")
         return {
             "data": {
-                "id": id_publico(_waha_message_id(result)),
+                "id": id_de_envio(chat_id, _waha_message_id(result)),
                 "confirmacao": "enviada",
                 "marcacoes": len(mentions),
                 "aviso": "Consulte whatsapp_confirmacao com este id para saber se foi entregue ou lida.",
@@ -1184,33 +1232,77 @@ class Bridge:
 
     def _recibo_de_grupo(self, message_id: str) -> dict | None:
         ref = referencia_de_grupo(message_id)
-        if not ref:
+        if ref:
+            chat, ids = ref
+            for mid in ids:
+                payload = self._mensagem_no_chat(chat, mid)
+                if payload:
+                    return self._recibo_de_payload(payload, message_id)
             return None
-        chat, ids = ref
-        for mid in ids:
-            path = (
+        pedido = message_id.strip()
+        if not BARE_ID_RE.match(pedido):
+            return None
+        return self._recibo_por_id_curto(pedido)
+
+    def _mensagem_no_chat(self, chat: str, message_id: str) -> dict | None:
+        path = (
+            "/api/"
+            + urllib.parse.quote(self.session, safe="")
+            + "/chats/"
+            + urllib.parse.quote(chat, safe="")
+            + "/messages/"
+            + urllib.parse.quote(message_id, safe="")
+        )
+        code, payload = self._waha("GET", path)
+        if code == 200 and isinstance(payload, dict) and payload.get("id"):
+            return payload
+        return None
+
+    def _recibo_de_payload(self, payload: dict, fallback_id: str) -> dict:
+        when = payload.get("timestamp") or payload.get("messageTimestamp")
+        publico = id_publico(str(payload.get("id") or fallback_id))
+        return {
+            "data": {
+                "id": publico,
+                "id_whatsapp": publico,
+                "sent_at": when,
+                "direction": "outbound" if payload.get("fromMe") else "inbound",
+                "type": payload.get("type") or "text",
+                "contato": "grupo",
+                **confirmacao_de_grupo(payload),
+            }
+        }
+
+    def _recibo_por_id_curto(self, bare: str) -> dict | None:
+        path = "/api/" + urllib.parse.quote(self.session, safe="") + "/chats/overview"
+        code, payload = self._waha("GET", path, query={"limit": "40"})
+        chats = payload if code == 200 and isinstance(payload, list) else []
+        grupos: list[str] = []
+        for chat in chats:
+            if not isinstance(chat, dict):
+                continue
+            cid = str(chat.get("id") or "")
+            if not cid.endswith("@g.us") or not CHAT_ID_RE.match(cid):
+                continue
+            grupos.append(cid)
+            last = chat.get("lastMessage") if isinstance(chat.get("lastMessage"), dict) else {}
+            if id_bate(bare, str(last.get("id") or "")):
+                found = self._mensagem_no_chat(cid, bare)
+                if found:
+                    return self._recibo_de_payload(found, bare)
+        for cid in grupos[:8]:
+            list_path = (
                 "/api/"
                 + urllib.parse.quote(self.session, safe="")
                 + "/chats/"
-                + urllib.parse.quote(chat, safe="")
-                + "/messages/"
-                + urllib.parse.quote(mid, safe="")
+                + urllib.parse.quote(cid, safe="")
+                + "/messages"
             )
-            code, payload = self._waha("GET", path)
-            if code != 200 or not isinstance(payload, dict) or not payload:
-                continue
-            when = payload.get("timestamp") or payload.get("messageTimestamp")
-            return {
-                "data": {
-                    "id": id_publico(str(payload.get("id") or message_id)),
-                    "id_whatsapp": id_publico(str(payload.get("id") or message_id)),
-                    "sent_at": when,
-                    "direction": "outbound" if payload.get("fromMe") else "inbound",
-                    "type": payload.get("type") or "text",
-                    "contato": "grupo",
-                    **confirmacao_de(payload.get("ack"), None, None, None),
-                }
-            }
+            code, rows = self._waha("GET", list_path, query={"limit": "20", "downloadMedia": "false"})
+            items = rows if code == 200 and isinstance(rows, list) else []
+            for item in items:
+                if isinstance(item, dict) and id_bate(bare, str(item.get("id") or "")):
+                    return self._recibo_de_payload(item, bare)
         return None
 
     def proxy(self, method: str, path: str, target: str, raw: bytes) -> object:

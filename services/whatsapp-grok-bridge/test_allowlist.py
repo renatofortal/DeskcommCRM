@@ -7,6 +7,9 @@ from server import (
     _receipt_filter,
     _waha_message_id,
     aplicar_marcacoes,
+    confirmacao_de_grupo,
+    id_bate,
+    id_de_envio,
     referencia_de_grupo,
     audio_blocks,
     chat_id_com_lid,
@@ -146,6 +149,25 @@ class ConfirmacaoTest(unittest.TestCase):
         chat, ids = referencia_de_grupo(composto)
         self.assertEqual(chat, "120363000000000000@g.us")
         self.assertEqual(ids[0], composto)
+        curto = "3EB0ABCDEF1234567890"
+        self.assertEqual(id_de_envio("120363000000000000@g.us", curto), composto)
+        self.assertTrue(id_bate(curto, composto))
+        recibo = confirmacao_de_grupo(
+            {
+                "ack": 0,
+                "ackName": "PENDING",
+                "_data": {
+                    "userReceipt": [
+                        {"userJid": "111111111111111@lid", "readTimestamp": 10},
+                        {"userJid": "222222222222222@lid", "receiptTimestamp": 9},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(recibo["confirmacao"], "lida")
+        self.assertEqual(recibo["lida_por"], 1)
+        self.assertEqual(recibo["entregue_para"], 2)
+        self.assertNotIn("111111111111111", json.dumps(recibo))
 
 
 class OAuthTest(unittest.TestCase):
