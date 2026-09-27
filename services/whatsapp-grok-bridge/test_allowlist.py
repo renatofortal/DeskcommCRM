@@ -3,8 +3,12 @@ import unittest
 from server import (
     OAuthDesk,
     PHONE_RE,
+    _receipt_filter,
+    _waha_message_id,
     audio_blocks,
+    chat_id_com_lid,
     confirmacao_de,
+    id_publico,
     image_blocks,
     is_allowed,
     mask_phone,
@@ -102,6 +106,18 @@ class ConfirmacaoTest(unittest.TestCase):
         self.assertEqual(confirmacao_de(4, "read", None, None)["confirmacao"], "ouvida")
         self.assertEqual(confirmacao_de(1, "sent", None, None)["confirmacao"], "enviada")
         self.assertEqual(confirmacao_de(-1, "failed", None, None)["confirmacao"], "falhou")
+
+    def test_id_do_envio_e_destino_com_lid(self):
+        self.assertEqual(_waha_message_id({"key": {"id": "3EB0ABCDEF1234567890"}}), "3EB0ABCDEF1234567890")
+        composto = "true_5500000000000@c.us_3EB0ABCDEF1234567890"
+        self.assertEqual(id_publico(composto), "3EB0ABCDEF1234567890")
+        self.assertNotIn("@", id_publico(composto) or "")
+        self.assertIn("external_id.like.*_3EB0ABCDEF1234567890", _receipt_filter("3EB0ABCDEF1234567890"))
+        destino = chat_id_com_lid(
+            "5511999999999",
+            [{"phone_number": "+5511999999999", "wa_lid": "123456789012345"}],
+        )
+        self.assertEqual(destino, "123456789012345@lid")
 
 
 class OAuthTest(unittest.TestCase):

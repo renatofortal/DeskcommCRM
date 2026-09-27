@@ -212,7 +212,7 @@ def summarize_groups(payload: object) -> dict:
     return {"data": rows, "meta": {"count": len(rows)}}
 
 
-CHAT_ID_RE = re.compile(r"^\d{5,30}@(c\.us|g\.us)$")
+CHAT_ID_RE = re.compile(r"^\d{5,30}@(c\.us|g\.us|lid)$")
 OAUTH_CLIENT_ID = "grok"
 CODE_TTL_S = 120
 TOKEN_TTL_S = 90 * 24 * 60 * 60
@@ -513,6 +513,9 @@ def _receipt_filter(message_id: str) -> str:
         bare = message_id.rsplit("_", 1)[-1]
         if bare != message_id and BARE_ID_RE.match(bare):
             parts.append(f"external_id.eq.{bare}")
+            parts.append(f"external_id.like.*_{bare}")
+        elif BARE_ID_RE.match(message_id):
+            parts.append(f"external_id.like.*_{message_id}")
     if not parts:
         raise BridgeError(400, "Informe o id da mensagem.")
     if len(parts) == 1:
@@ -537,13 +540,64 @@ def image_blocks(summary: dict, image: bytes | None, mime: str) -> list:
     return blocks
 
 
-def _waha_message_id(result: object) -> object:
+def _id_de(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("_serialized", "id", "ID"):
+            found = _id_de(value.get(key))
+            if found:
+                return found
+    return None
+
+
+def _waha_message_id(result: object) -> str | None:
     if not isinstance(result, dict):
         return None
-    message_id = result.get("id")
-    if isinstance(message_id, dict):
-        return message_id.get("id") or message_id.get("_serialized")
-    return message_id
+    found = _id_de(result.get("id"))
+    if found:
+        return found
+    key = result.get("key")
+    if isinstance(key, dict):
+        found = _id_de(key.get("id")) or _id_de(key.get("_serialized"))
+        if found:
+            return found
+    data = result.get("_data")
+    if isinstance(data, dict) and data is not result:
+        return _waha_message_id(data)
+    return None
+
+
+def id_publico(message_id: object) -> str | None:
+    if not isinstance(message_id, str):
+        return None
+    text = message_id.strip()
+    if not text:
+        return None
+    if "@" in text:
+        bare = text.rsplit("_", 1)[-1]
+        if BARE_ID_RE.match(bare):
+            return bare
+    return text
+
+
+def _mesmo_telefone(pedido: str, gravado: str) -> bool:
+    esquerda = re.sub(r"\D", "", pedido)
+    direita = re.sub(r"\D", "", gravado)
+    if len(esquerda) < 10 or len(direita) < 10:
+        return False
+    return esquerda[-8:] == direita[-8:] and abs(len(esquerda) - len(direita)) <= 3
+
+
+def chat_id_com_lid(phone: str, contacts: list) -> str:
+    digits = re.sub(r"\D", "", phone)
+    for row in contacts:
+        if not isinstance(row, dict) or not _mesmo_telefone(digits, str(row.get("phone_number") or "")):
+            continue
+        lid = re.sub(r"\D", "", str(row.get("wa_lid") or ""))
+        if lid:
+            return f"{lid}@lid"
+    return f"{digits}@c.us"
 
 
 def confirmacao_de(ack: object, status: object, delivered_at: object, read_at: object) -> dict:
@@ -688,9 +742,11 @@ class Bridge:
             chat_id = str(arguments.get("chat_id") or "")
             if chat_id:
                 if not CHAT_ID_RE.match(chat_id):
-                    raise BridgeError(400, "chat_id precisa terminar em @c.us ou @g.us.")
+                    raise BridgeError(400, "chat_id precisa terminar em @c.us, @lid ou @g.us.")
                 if not text or len(text) > 4000:
                     raise BridgeError(400, "Informe text com ate 4000 caracteres.")
+                if chat_id.endswith("@c.us"):
+                    chat_id = self._chat_de_telefone(chat_id.split("@", 1)[0])
                 code, sent = self._waha("POST", "/api/sendText", {"session": self.session, "chatId": chat_id, "text": text})
                 if code == 403:
                     raise BridgeError(403, "Envio recusado pela chave da sessao.")
@@ -698,8 +754,7 @@ class Bridge:
                     raise BridgeError(502, "O WhatsApp nao aceitou o envio.")
                 result = {
                     "data": {
-                        "id": _waha_message_id(sent),
-                        "chat_id": chat_id,
+                        "id": id_publico(_waha_message_id(sent)),
                         "confirmacao": "enviada",
                         "aviso": "Consulte whatsapp_confirmacao com este id para saber se foi entregue ou lida.",
                     }
@@ -793,10 +848,17 @@ class Bridge:
             contact = contact[0] if contact else {}
         if not isinstance(contact, dict):
             contact = {}
-        return {
+        external_id = str(row.get("external_id") or "")
+        aviso = None
+        if "@c.us" in external_id and row.get("ack") in (0, None, "0"):
+            aviso = (
+                "O recibo deste envio nao foi gravado. "
+                "Mensagens novas para a mesma pessoa passam a mostrar entrega e leitura."
+            )
+        data = {
             "data": {
                 "id": row.get("id"),
-                "external_id": row.get("external_id"),
+                "id_whatsapp": id_publico(external_id),
                 "sent_at": row.get("sent_at"),
                 "direction": row.get("direction"),
                 "type": row.get("type"),
@@ -805,6 +867,19 @@ class Bridge:
                 **confirmacao_de(row.get("ack"), row.get("status"), row.get("delivered_at"), row.get("read_at")),
             }
         }
+        if aviso:
+            data["data"]["aviso"] = aviso
+        return data
+
+    def _chat_de_telefone(self, phone: str) -> str:
+        _, org_id = self._channel_ids()
+        tail = re.sub(r"\D", "", phone)[-8:]
+        rows = self._supabase(
+            "contacts?select=wa_lid,phone_number"
+            f"&organization_id=eq.{org_id}"
+            f"&phone_number=like.*{tail}&limit=20"
+        )
+        return chat_id_com_lid(phone, rows)
 
     def audio_message(self, message_id: str) -> list:
         if not UUID_RE.match(message_id):
@@ -920,13 +995,13 @@ class Bridge:
         code, result = self._waha(
             "POST",
             "/api/sendText",
-            {"session": self.session, "chatId": f"{phone}@c.us", "text": text},
+            {"session": self.session, "chatId": self._chat_de_telefone(phone), "text": text},
         )
         if code == 403:
             raise BridgeError(403, "Envio recusado pela chave da sessao.")
         if code not in (200, 201) or not isinstance(result, dict):
             raise BridgeError(502, "O WhatsApp nao aceitou o envio.")
-        message_id = _waha_message_id(result)
+        message_id = id_publico(_waha_message_id(result))
         return {
             "data": {
                 "id": message_id,
