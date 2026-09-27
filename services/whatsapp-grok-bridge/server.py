@@ -9,10 +9,15 @@ sessão nem troca de chave. Não há rotina de resposta automática.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import html
 import json
 import os
 import re
 import hmac
+import secrets
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -177,6 +182,173 @@ def summarize_groups(payload: object) -> dict:
 
 
 CHAT_ID_RE = re.compile(r"^\d{5,30}@(c\.us|g\.us)$")
+OAUTH_CLIENT_ID = "grok"
+CODE_TTL_S = 120
+TOKEN_TTL_S = 90 * 24 * 60 * 60
+
+
+def oauth_kind(path: str) -> str | None:
+    clean = _clean_path(path)
+    for suffix, kind in (("/oauth/authorize", "authorize"), ("/oauth/token", "token")):
+        if clean == suffix or clean.endswith(suffix):
+            return kind
+    return None
+
+
+def redirect_allowed(url: str) -> bool:
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "https" or not host:
+        return False
+    return host == "grok.com" or host.endswith(".grok.com") or host == "x.ai" or host.endswith(".x.ai")
+
+
+def pkce_s256(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+class OAuthDesk:
+    def __init__(self, token: str):
+        self.token = token
+        self._codes: dict[str, tuple[float, str, str]] = {}
+        self._lock = threading.Lock()
+
+    def page(self, query: dict[str, str]) -> tuple[int, str]:
+        error = self._request_error(query)
+        if error:
+            return 400, _page("Nao foi possivel abrir a conexao", error)
+        return 200, _consent(query)
+
+    def approve(self, form: dict[str, str]) -> tuple[int, str | None, str]:
+        error = self._request_error(form)
+        if error:
+            return 400, None, _page("Nao foi possivel conectar", error)
+        given = str(form.get("senha") or "")
+        if not given or not hmac.compare_digest(given, self.token):
+            return 401, None, _page("Token nao confere", "O token da ponte nao confere. Pegue de novo no terminal e tente outra vez.")
+        code = secrets.token_urlsafe(32)
+        with self._lock:
+            self._drop_expired()
+            self._codes[code] = (time.time() + CODE_TTL_S, form["code_challenge"], form["redirect_uri"])
+        target = urllib.parse.urlsplit(form["redirect_uri"])
+        params = dict(urllib.parse.parse_qsl(target.query, keep_blank_values=True))
+        params["code"] = code
+        if form.get("state"):
+            params["state"] = form["state"]
+        location = urllib.parse.urlunsplit((target.scheme, target.netloc, target.path, urllib.parse.urlencode(params), ""))
+        return 302, location, ""
+
+    def exchange(self, form: dict[str, str]) -> tuple[int, dict]:
+        grant = form.get("grant_type") or ""
+        if form.get("client_id") not in ("", OAUTH_CLIENT_ID):
+            return 400, {"error": "invalid_client"}
+        if grant == "refresh_token":
+            if not _refresh_ok(self.token, form.get("refresh_token") or ""):
+                return 400, {"error": "invalid_grant"}
+            return 200, _token_body(self.token)
+        if grant != "authorization_code":
+            return 400, {"error": "unsupported_grant_type"}
+        code = form.get("code") or ""
+        verifier = form.get("code_verifier") or ""
+        with self._lock:
+            self._drop_expired()
+            saved = self._codes.pop(code, None)
+        if not saved:
+            return 400, {"error": "invalid_grant"}
+        _expires, challenge, redirect = saved
+        if form.get("redirect_uri") and form.get("redirect_uri") != redirect:
+            return 400, {"error": "invalid_grant"}
+        try:
+            got = pkce_s256(verifier)
+        except UnicodeEncodeError:
+            return 400, {"error": "invalid_grant"}
+        if not hmac.compare_digest(got, challenge.rstrip("=")):
+            return 400, {"error": "invalid_grant"}
+        return 200, _token_body(self.token)
+
+    def _request_error(self, query: dict[str, str]) -> str | None:
+        if query.get("client_id") not in ("", OAUTH_CLIENT_ID):
+            return "O ID do cliente tem de ser grok."
+        if query.get("response_type") not in ("", "code"):
+            return "O Grok precisa pedir o codigo de autorizacao."
+        if query.get("code_challenge_method") not in ("", "S256"):
+            return "Este conector so aceita PKCE S256."
+        if not query.get("code_challenge"):
+            return "Faltou o desafio PKCE."
+        if not redirect_allowed(query.get("redirect_uri") or ""):
+            return "O retorno precisa ser um endereco https do Grok."
+        return None
+
+    def _drop_expired(self) -> None:
+        now = time.time()
+        self._codes = {key: value for key, value in self._codes.items() if value[0] > now}
+
+
+def _refresh_ok(token: str, refresh: str) -> bool:
+    exp, sep, sig = refresh.partition(".")
+    if not sep or not exp.isdigit():
+        return False
+    if int(exp) < int(time.time()):
+        return False
+    expected = hmac.new(token.encode("utf-8"), exp.encode("ascii"), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
+def _token_body(token: str) -> dict:
+    exp = int(time.time()) + TOKEN_TTL_S
+    sig = hmac.new(token.encode("utf-8"), str(exp).encode("ascii"), hashlib.sha256).hexdigest()
+    return {
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": TOKEN_TTL_S,
+        "refresh_token": f"{exp}.{sig}",
+    }
+
+
+def _page(title: str, message: str) -> str:
+    return (
+        "<!doctype html><meta charset=utf-8><title>"
+        + html.escape(title)
+        + "</title><body style=\"font-family:sans-serif;max-width:28rem;margin:2rem auto;padding:0 1rem\">"
+        + "<h1 style=\"font-size:1.2rem\">"
+        + html.escape(title)
+        + "</h1><p>"
+        + html.escape(message)
+        + "</p></body>"
+    )
+
+
+def _consent(query: dict[str, str]) -> str:
+    hidden = "".join(
+        f'<input type="hidden" name="{html.escape(key)}" value="{html.escape(query.get(key) or "")}">'
+        for key in ("client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method", "response_type", "scope")
+    )
+    return (
+        "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+        "<title>Conectar o Grok</title>"
+        "<body style=\"font-family:sans-serif;max-width:28rem;margin:2rem auto;padding:0 1rem\">"
+        "<h1 style=\"font-size:1.25rem\">Conectar o Grok a este WhatsApp</h1>"
+        "<p>A conta é somente +5585992001234. Cole o token da ponte. Ele não fica gravado nesta página.</p>"
+        "<form method=post>"
+        + hidden
+        + '<label>Token<br><input name=senha type=password autocomplete=off required style="width:100%;padding:.6rem"></label>'
+        '<p><button type=submit style="padding:.6rem 1rem">Conectar</button></p>'
+        "</form></body>"
+    )
+
+
+def _form_dict(raw: bytes, content_type: str | None) -> dict[str, str]:
+    text = raw.decode("utf-8", "replace")
+    if content_type and "application/json" in content_type:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        return {str(key): "" if value is None else str(value) for key, value in payload.items()}
+    return {key: value for key, value in urllib.parse.parse_qsl(text, keep_blank_values=True)}
 
 
 def mcp_message(payload: object, invoke) -> tuple[int, dict | None]:
@@ -266,6 +438,7 @@ class Bridge:
             raise SystemExit("sessao invalida")
         if not self.token or not self.waha_key:
             raise SystemExit("credencial ausente")
+        self.oauth = OAuthDesk(self.token)
         self._hits: list[float] = []
         self._channel: tuple[str, str] | None = None
 
@@ -547,6 +720,28 @@ def make_handler(bridge: Bridge):
                 self._send(413, {"error": {"message": "Pedido grande demais."}})
                 return
             raw = self.rfile.read(length) if length else b""
+            kind = oauth_kind(self.path)
+            if kind == "authorize" and self.command == "GET":
+                query = {key: value for key, value in urllib.parse.parse_qsl(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)}
+                status, page = bridge.oauth.page(query)
+                self._html(status, page)
+                return
+            if kind == "authorize" and self.command == "POST":
+                form = _form_dict(raw, self.headers.get("Content-Type"))
+                status, location, page = bridge.oauth.approve(form)
+                if location:
+                    self.send_response(status)
+                    self.send_header("Location", location)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self._html(status, page)
+                return
+            if kind == "token" and self.command == "POST":
+                form = _form_dict(raw, self.headers.get("Content-Type"))
+                status, payload = bridge.oauth.exchange(form)
+                self._send(status, payload)
+                return
             if is_mcp(self.path) and self.command == "GET":
                 self._send(200, {"ok": True, "mcp": True})
                 return
@@ -589,6 +784,15 @@ def make_handler(bridge: Bridge):
             if status == 401:
                 self.send_header("WWW-Authenticate", 'Bearer realm="whatsapp"')
             self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _html(self, status: int, page: str):
+            body = page.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
 

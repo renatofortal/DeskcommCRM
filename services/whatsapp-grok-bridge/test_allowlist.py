@@ -1,6 +1,6 @@
 import unittest
 
-from server import PHONE_RE, is_allowed, mask_phone, mcp_message, mcp_tools, summarize_groups
+from server import OAuthDesk, PHONE_RE, is_allowed, mask_phone, mcp_message, mcp_tools, pkce_s256, summarize_groups
 
 
 class AllowlistTest(unittest.TestCase):
@@ -67,6 +67,55 @@ class McpTest(unittest.TestCase):
         self.assertEqual(brief["meta"]["count"], 1)
         self.assertEqual(brief["data"][0]["nome"], "Equipe")
         self.assertNotIn("5585992001234", str(brief))
+
+
+class OAuthTest(unittest.TestCase):
+    def _query(self, challenge: str, redirect: str = "https://grok.com/connectors-oauth-exchange-code/") -> dict:
+        return {
+            "response_type": "code",
+            "client_id": "grok",
+            "redirect_uri": redirect,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "abc",
+        }
+
+    def test_recusa_retorno_fora_do_grok(self):
+        desk = OAuthDesk("token-de-teste")
+        status, page = desk.page(self._query(pkce_s256("verificador-valido-123456"), "https://example.com/callback"))
+        self.assertEqual(status, 400)
+        self.assertIn("Grok", page)
+
+    def test_troca_codigo_por_acesso(self):
+        desk = OAuthDesk("token-de-teste")
+        verifier = "verificador-valido-1234567890"
+        form = self._query(pkce_s256(verifier))
+        form["senha"] = "token-de-teste"
+        status, location, _page = desk.approve(form)
+        self.assertEqual(status, 302)
+        code = dict(pair.split("=", 1) for pair in location.split("?", 1)[1].split("&"))["code"]
+        status, body = desk.exchange(
+            {
+                "grant_type": "authorization_code",
+                "client_id": "grok",
+                "code": code,
+                "code_verifier": verifier,
+                "redirect_uri": form["redirect_uri"],
+            }
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["token_type"], "Bearer")
+        self.assertEqual(body["access_token"], "token-de-teste")
+        again, _ = desk.exchange(
+            {
+                "grant_type": "authorization_code",
+                "client_id": "grok",
+                "code": code,
+                "code_verifier": verifier,
+                "redirect_uri": form["redirect_uri"],
+            }
+        )
+        self.assertEqual(again, 400)
 
 
 if __name__ == "__main__":

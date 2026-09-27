@@ -31,10 +31,19 @@ computador e no celular, usa outro endereço, com cadeado, no mesmo site do CRM:
 `https://crm.verticesales.com.br/wa-assistente/mcp`
 
 Esse endereço só abre o conector. O painel do WhatsApp continua fechado.
-No Grok: grok.com/connectors, Novo conector, Personalizado. Cole a URL acima
-e, no campo de autenticação, o valor de `BRIDGE_TOKEN` como
-`Bearer <token>`. O conector fica na conta, então o celular passa a enxergar
-as mesmas ferramentas.
+No Grok: grok.com/connectors, Novo conector, Personalizado. A URL do servidor
+é a de cima. Na tela de OAuth:
+
+| campo | valor |
+|---|---|
+| ID do Cliente | `grok` |
+| Segredo do Cliente | deixe vazio |
+| Endpoint de Autorização | `https://crm.verticesales.com.br/wa-assistente/oauth/authorize` |
+| Endpoint do Token | `https://crm.verticesales.com.br/wa-assistente/oauth/token` |
+| Escopos | deixe vazio |
+| Método | nenhum (somente PKCE) |
+
+Salvar abre uma página pedindo o `BRIDGE_TOKEN`. O conector fica na conta, então o celular passa a enxergar as mesmas ferramentas.
 
 ## Credencial
 
