@@ -110,7 +110,7 @@ def mcp_tools() -> list[dict]:
         },
         {
             "name": "whatsapp_confirmacao",
-            "description": "Diz se uma mensagem foi enviada, entregue no celular ou lida. Vale para conversa individual e para grupo, com o id curto ou o id completo devolvido no envio. No grupo, entregue_para e lida_por contam participantes e nao dizem quem.",
+            "description": "Diz se uma mensagem foi enviada, entregue no celular ou lida. Vale para conversa individual e para grupo, com o id curto ou o id completo. No grupo, quem_leu lista quem ja leu e quem_recebeu lista quem recebeu e ainda nao leu. O item e o nome da agenda, ou o telefone quando nao ha nome.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string"}},
@@ -145,7 +145,7 @@ def mcp_tools() -> list[dict]:
         },
         {
             "name": "whatsapp_mensagens_grupo",
-            "description": "Le as mensagens recentes de qualquer grupo deste WhatsApp. O id termina em @g.us.",
+            "description": "Le as mensagens recentes de qualquer grupo deste WhatsApp. O id termina em @g.us. Nas mensagens enviadas por voce, quem_leu e quem_recebeu dizem quem leu e quem so recebeu.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string"}},
@@ -260,7 +260,7 @@ def _nome_no_grupo(item: dict) -> str:
     return "participante"
 
 
-def summarize_group_messages(payload: object) -> dict:
+def summarize_group_messages(payload: object, rotulos: dict[str, str] | None = None, eu: set[str] | None = None) -> dict:
     rows = payload if isinstance(payload, list) else []
     if isinstance(payload, dict):
         nested = payload.get("messages")
@@ -272,15 +272,16 @@ def summarize_group_messages(payload: object) -> dict:
         key = item.get("key") if isinstance(item.get("key"), dict) else {}
         message_id = _waha_message_id(item) or _id_de(key.get("id"))
         when = item.get("timestamp") or item.get("messageTimestamp")
-        saidas.append(
-            {
-                "id": id_publico(message_id),
-                "quando": when,
-                "de": _nome_no_grupo(item),
-                "tipo": _tipo_de_mensagem(item),
-                "texto": _texto_de_mensagem(item)[:4000],
-            }
-        )
+        linha = {
+            "id": id_publico(message_id),
+            "quando": when,
+            "de": _nome_no_grupo(item),
+            "tipo": _tipo_de_mensagem(item),
+            "texto": _texto_de_mensagem(item)[:4000],
+        }
+        if rotulos is not None:
+            linha.update(quem_leu_no_grupo(item, rotulos, eu or set()))
+        saidas.append(linha)
     saidas.sort(key=lambda row: row["quando"] or 0)
     if len(saidas) > 40:
         saidas = saidas[-40:]
@@ -825,6 +826,102 @@ def id_bate(pedido: str, candidato: str) -> bool:
     return "@g.us" in candidato and candidato.endswith("_" + pedido)
 
 
+def push_dos_autores(rows: object) -> dict[str, str]:
+    saida: dict[str, str] = {}
+    if not isinstance(rows, list):
+        return saida
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("key") if isinstance(item.get("key"), dict) else {}
+        data = item.get("_data") if isinstance(item.get("_data"), dict) else {}
+        participant = str(item.get("participant") or key.get("participant") or data.get("participant") or "")
+        nome = _nome_legivel(item.get("pushName") or data.get("pushName"))
+        if participant and nome and participant not in saida:
+            saida[participant] = nome
+    return saida
+
+
+def _nome_legivel(value: object) -> str:
+    text = str(value or "").strip()
+    if not text or "@" in text or text.isdigit():
+        return ""
+    return text[:80]
+
+
+def rotulo_do_leitor(
+    jid: str,
+    phone: str,
+    por_lid: dict[str, str],
+    por_telefone: dict[str, str],
+    por_push: dict[str, str],
+) -> str:
+    lid = re.sub(r"\D", "", jid.split("@", 1)[0])
+    fone = re.sub(r"\D", "", phone)
+    tail = fone[-8:] if len(fone) >= 8 else ""
+    for bruto in (por_lid.get(lid), por_lid.get(jid), por_push.get(jid), por_telefone.get(tail)):
+        nome = _nome_legivel(bruto)
+        if nome:
+            return nome
+    if len(fone) >= 10:
+        return fone
+    return ""
+
+
+def _sou_eu(jid: str, phone: str, eu: set[str]) -> bool:
+    cands = [jid, re.sub(r"\D", "", jid), re.sub(r"\D", "", phone)]
+    for cand in cands:
+        if cand and cand in eu:
+            return True
+    fone = re.sub(r"\D", "", phone)
+    for item in eu:
+        if fone and _mesmo_telefone(fone, item):
+            return True
+    return False
+
+
+def quem_leu_no_grupo(payload: dict, rotulos: dict[str, str], eu: set[str]) -> dict:
+    data = payload.get("_data") if isinstance(payload.get("_data"), dict) else {}
+    receipts = data.get("userReceipt")
+    if not isinstance(receipts, list):
+        return {}
+    leram: list[str] = []
+    receberam: list[str] = []
+    for row in receipts:
+        if not isinstance(row, dict):
+            continue
+        jid = str(row.get("userJid") or "")
+        if not jid or _sou_eu(jid, "", eu):
+            continue
+        nome = rotulos.get(jid) or ""
+        if not nome or nome in leram or nome in receberam:
+            continue
+        if row.get("readTimestamp") or row.get("playedTimestamp"):
+            leram.append(nome)
+        elif row.get("receiptTimestamp"):
+            receberam.append(nome)
+    saida: dict = {}
+    if leram:
+        saida["quem_leu"] = leram
+    if receberam:
+        saida["quem_recebeu"] = receberam
+    return saida
+
+
+def chat_do_payload(payload: dict) -> str | None:
+    for value in (payload.get("from"),):
+        if isinstance(value, str) and CHAT_ID_RE.match(value) and value.endswith("@g.us"):
+            return value
+    key = payload.get("key") if isinstance(payload.get("key"), dict) else {}
+    remote = key.get("remoteJid")
+    if isinstance(remote, str) and CHAT_ID_RE.match(remote) and remote.endswith("@g.us"):
+        return remote
+    ref = referencia_de_grupo(str(payload.get("id") or ""))
+    if ref:
+        return ref[0]
+    return None
+
+
 def audio_blocks(summary: dict, audio: bytes | None, mime: str) -> list:
     blocks: list = [{"type": "text", "text": json.dumps(summary, ensure_ascii=False)}]
     if audio and mime.startswith("audio/"):
@@ -973,7 +1070,9 @@ class Bridge:
             raise BridgeError(404, "Grupo nao encontrado.")
         if code not in (200, 201):
             raise BridgeError(502, "Nao foi possivel ler as mensagens deste grupo.")
-        return summarize_group_messages(payload)
+        itens = payload if isinstance(payload, list) else []
+        rotulos = self._rotulos_do_grupo(group_id, itens)
+        return summarize_group_messages(payload, rotulos, self._eu_ids())
 
     def session_status(self) -> dict:
         code, payload = self._waha("GET", f"/api/sessions/{self.session}")
@@ -1261,6 +1360,10 @@ class Bridge:
     def _recibo_de_payload(self, payload: dict, fallback_id: str) -> dict:
         when = payload.get("timestamp") or payload.get("messageTimestamp")
         publico = id_publico(str(payload.get("id") or fallback_id))
+        leitores: dict = {}
+        chat = chat_do_payload(payload)
+        if chat:
+            leitores = quem_leu_no_grupo(payload, self._rotulos_do_grupo(chat, [payload]), self._eu_ids())
         return {
             "data": {
                 "id": publico,
@@ -1270,8 +1373,127 @@ class Bridge:
                 "type": payload.get("type") or "text",
                 "contato": "grupo",
                 **confirmacao_de_grupo(payload),
+                **leitores,
             }
         }
+
+    def _eu_ids(self) -> set[str]:
+        cached = getattr(self, "_eu_cache", None)
+        if cached is not None:
+            return cached
+        ids: set[str] = set()
+        code, payload = self._waha("GET", "/api/sessions/" + urllib.parse.quote(self.session, safe=""))
+        me = payload.get("me") if code == 200 and isinstance(payload, dict) and isinstance(payload.get("me"), dict) else {}
+        for key in ("id", "lid"):
+            value = str(me.get(key) or "")
+            if not value:
+                continue
+            ids.add(value)
+            digits = re.sub(r"\D", "", value)
+            if digits:
+                ids.add(digits)
+        self._eu_cache = ids
+        return ids
+
+    def _nomes_no_crm(self, lids: list[str], phones: list[str]) -> tuple[dict[str, str], dict[str, str]]:
+        por_lid: dict[str, str] = {}
+        por_fone: dict[str, str] = {}
+        _, org_id = self._channel_ids()
+
+        def ler(query: str) -> list:
+            try:
+                return self._supabase(query)
+            except BridgeError:
+                return []
+
+        unicos = []
+        for lid in lids:
+            if lid and lid not in unicos:
+                unicos.append(lid)
+        if unicos:
+            rows = ler(
+                "contacts?select=display_name,wa_lid,phone_number"
+                f"&organization_id=eq.{org_id}"
+                f"&wa_lid=in.({','.join(unicos[:30])})"
+                "&limit=40"
+            )
+            for row in rows:
+                nome = _nome_legivel(row.get("display_name"))
+                lid = re.sub(r"\D", "", str(row.get("wa_lid") or ""))
+                tail = re.sub(r"\D", "", str(row.get("phone_number") or ""))[-8:]
+                if not nome:
+                    continue
+                if lid:
+                    por_lid[lid] = nome
+                if len(tail) == 8:
+                    por_fone[tail] = nome
+        faltam = []
+        for phone in phones:
+            tail = phone[-8:]
+            if len(tail) == 8 and tail not in por_fone and tail not in faltam:
+                faltam.append(tail)
+        if faltam:
+            clauses = ",".join(f"phone_number.like.*{tail}" for tail in faltam[:20])
+            rows = ler(
+                "contacts?select=display_name,phone_number"
+                f"&organization_id=eq.{org_id}"
+                f"&or=({clauses})"
+                "&limit=40"
+            )
+            for row in rows:
+                nome = _nome_legivel(row.get("display_name"))
+                tail = re.sub(r"\D", "", str(row.get("phone_number") or ""))[-8:]
+                if nome and len(tail) == 8:
+                    por_fone[tail] = nome
+        return por_lid, por_fone
+
+    def _rotulos_do_grupo(self, chat_id: str, mensagens: list) -> dict[str, str]:
+        path = (
+            "/api/"
+            + urllib.parse.quote(self.session, safe="")
+            + "/groups/"
+            + urllib.parse.quote(chat_id, safe="")
+        )
+        code, group = self._waha("GET", path)
+        parts = group.get("participants") if code == 200 and isinstance(group, dict) else []
+        if not isinstance(parts, list):
+            parts = []
+        pushes = push_dos_autores(mensagens)
+        if not pushes:
+            list_path = (
+                "/api/"
+                + urllib.parse.quote(self.session, safe="")
+                + "/chats/"
+                + urllib.parse.quote(chat_id, safe="")
+                + "/messages"
+            )
+            code, rows = self._waha("GET", list_path, query={"limit": "30", "downloadMedia": "false"})
+            pushes = push_dos_autores(rows if code == 200 and isinstance(rows, list) else [])
+        lids: list[str] = []
+        phones: list[str] = []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            lid = re.sub(r"\D", "", str(part.get("id") or "").split("@", 1)[0])
+            phone = re.sub(r"\D", "", str(part.get("phoneNumber") or ""))
+            if lid:
+                lids.append(lid)
+            if len(phone) >= 8:
+                phones.append(phone)
+        por_lid, por_fone = self._nomes_no_crm(lids, phones)
+        eu = self._eu_ids()
+        rotulos: dict[str, str] = {}
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            jid = str(part.get("id") or "")
+            phone = str(part.get("phoneNumber") or "")
+            if not jid or _sou_eu(jid, phone, eu):
+                continue
+            rotulo = rotulo_do_leitor(jid, phone, por_lid, por_fone, pushes)
+            if rotulo:
+                rotulos[jid] = rotulo
+        return rotulos
 
     def _recibo_por_id_curto(self, bare: str) -> dict | None:
         path = "/api/" + urllib.parse.quote(self.session, safe="") + "/chats/overview"

@@ -10,7 +10,9 @@ from server import (
     confirmacao_de_grupo,
     id_bate,
     id_de_envio,
+    quem_leu_no_grupo,
     referencia_de_grupo,
+    rotulo_do_leitor,
     audio_blocks,
     chat_id_com_lid,
     confirmacao_de,
@@ -168,6 +170,35 @@ class ConfirmacaoTest(unittest.TestCase):
         self.assertEqual(recibo["lida_por"], 1)
         self.assertEqual(recibo["entregue_para"], 2)
         self.assertNotIn("111111111111111", json.dumps(recibo))
+        rotulos = {
+            "111111111111111@lid": rotulo_do_leitor(
+                "111111111111111@lid",
+                "5511999999999@s.whatsapp.net",
+                {"111111111111111": "Ana"},
+                {},
+                {},
+            ),
+            "222222222222222@lid": rotulo_do_leitor(
+                "222222222222222@lid",
+                "5511888887777@s.whatsapp.net",
+                {},
+                {},
+                {},
+            ),
+        }
+        leitores = quem_leu_no_grupo(recibo and {
+            "_data": {
+                "userReceipt": [
+                    {"userJid": "111111111111111@lid", "readTimestamp": 10},
+                    {"userJid": "222222222222222@lid", "receiptTimestamp": 9},
+                    {"userJid": "999999999999999@lid", "readTimestamp": 8},
+                ]
+            }
+        }, rotulos, {"999999999999999@lid", "999999999999999"})
+        self.assertEqual(leitores["quem_leu"], ["Ana"])
+        self.assertEqual(leitores["quem_recebeu"], ["5511888887777"])
+        self.assertNotIn("999999999999999", json.dumps(leitores))
+        self.assertNotIn("@", json.dumps(leitores))
 
 
 class OAuthTest(unittest.TestCase):
