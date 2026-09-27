@@ -95,8 +95,18 @@ def mcp_tools() -> list[dict]:
         },
         {
             "name": "whatsapp_mensagens",
-            "description": "Lista as 50 mensagens mais recentes guardadas no CRM, inclusive as enviadas pelo aplicativo do celular.",
+            "description": "Lista as 50 mensagens mais recentes. Audio ja transcrito vem no campo transcricao. Para ouvir o arquivo, use whatsapp_audio com o id.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "whatsapp_audio",
+            "description": "Ouve um audio do WhatsApp. Devolve a transcricao e o arquivo. O id e o da mensagem.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": False,
+            },
         },
         {
             "name": "whatsapp_grupos",
@@ -451,20 +461,37 @@ def mcp_message(payload: object, invoke) -> tuple[int, dict | None]:
         if name not in known:
             return 200, {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "Ferramenta desconhecida."}}
         try:
-            text = invoke(name, arguments)
+            content = _as_content(invoke(name, arguments))
         except BridgeError as exc:
-            text = exc.message
             return 200, {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {"content": [{"type": "text", "text": text}], "isError": True},
+                "result": {"content": [{"type": "text", "text": exc.message}], "isError": True},
             }
         return 200, {
             "jsonrpc": "2.0",
             "id": request_id,
-            "result": {"content": [{"type": "text", "text": text}], "isError": False},
+            "result": {"content": content, "isError": False},
         }
     return 200, {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Metodo desconhecido."}}
+
+
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+AUDIO_TYPES = {"audio", "ptt", "voice"}
+MAX_AUDIO = 3 * 1024 * 1024
+
+
+def _as_content(value: object) -> list:
+    if isinstance(value, list):
+        return value
+    return [{"type": "text", "text": str(value)}]
+
+
+def audio_blocks(summary: dict, audio: bytes | None, mime: str) -> list:
+    blocks: list = [{"type": "text", "text": json.dumps(summary, ensure_ascii=False)}]
+    if audio and mime.startswith("audio/"):
+        blocks.append({"type": "audio", "data": base64.b64encode(audio).decode("ascii"), "mimeType": mime.split(";")[0]})
+    return blocks
 
 
 def is_allowed(method: str, path: str) -> bool:
@@ -538,6 +565,8 @@ class Bridge:
             result = self.session_status()
         elif name == "whatsapp_mensagens":
             result = self.list_messages()
+        elif name == "whatsapp_audio":
+            return self.audio_message(str(arguments.get("id") or ""))
         elif name == "whatsapp_grupos":
             result = summarize_groups(self.proxy("GET", "/v1/groups", "/v1/groups", b""))
         elif name == "whatsapp_grupo":
@@ -602,7 +631,7 @@ class Bridge:
     def list_messages(self) -> dict:
         channel_id, org_id = self._channel_ids()
         query = (
-            "messages?select=id,sent_at,direction,sent_via,type,body,"
+            "messages?select=id,sent_at,direction,sent_via,type,body,media_derived_text,"
             "contacts(display_name,phone_number)"
             f"&channel_session_id=eq.{channel_id}"
             f"&organization_id=eq.{org_id}"
@@ -624,11 +653,70 @@ class Bridge:
                     "sent_via": row.get("sent_via"),
                     "type": row.get("type"),
                     "body": row.get("body") or "",
+                    "transcricao": row.get("media_derived_text") or "",
                     "contact_name": contact.get("display_name") or "",
                     "contact_phone": contact.get("phone_number") or "",
                 }
             )
         return {"data": data, "meta": {"count": len(data)}}
+
+    def audio_message(self, message_id: str) -> list:
+        if not UUID_RE.match(message_id):
+            raise BridgeError(400, "Informe o id da mensagem.")
+        channel_id, org_id = self._channel_ids()
+        query = (
+            "messages?select=id,type,sent_at,media_mime,media_derived_text,media_derived_status,media_storage_path,"
+            "contacts(display_name,phone_number)"
+            f"&id=eq.{message_id}"
+            f"&channel_session_id=eq.{channel_id}"
+            f"&organization_id=eq.{org_id}"
+            "&limit=1"
+        )
+        rows = self._supabase(query)
+        if not rows:
+            raise BridgeError(404, "Audio nao encontrado neste WhatsApp.")
+        row = rows[0]
+        kind = str(row.get("type") or "")
+        mime = str(row.get("media_mime") or "audio/ogg")
+        if kind not in AUDIO_TYPES and not mime.startswith("audio/"):
+            raise BridgeError(400, "Essa mensagem nao e um audio.")
+        contact = row.get("contacts")
+        if isinstance(contact, list):
+            contact = contact[0] if contact else {}
+        if not isinstance(contact, dict):
+            contact = {}
+        summary = {
+            "id": row.get("id"),
+            "sent_at": row.get("sent_at"),
+            "contato": contact.get("display_name") or "",
+            "telefone": mask_phone(str(contact.get("phone_number") or "")),
+            "transcricao": row.get("media_derived_text") or "",
+            "transcricao_status": row.get("media_derived_status") or "",
+        }
+        audio = self._download_audio(str(row.get("media_storage_path") or ""))
+        if audio is None and not summary["transcricao"]:
+            summary["aviso"] = "O arquivo de audio nao esta guardado."
+        elif audio is None:
+            summary["aviso"] = "A transcricao esta pronta. O arquivo passou do tamanho que o conector envia."
+        return audio_blocks(summary, audio, mime if mime.startswith("audio/") else "audio/ogg")
+
+    def _download_audio(self, path: str) -> bytes | None:
+        if not path or ".." in path or path.startswith("/"):
+            return None
+        url = self.supabase + "/storage/v1/object/whatsapp-media/" + urllib.parse.quote(path, safe="/")
+        req = urllib.request.Request(url)
+        req.add_header("apikey", self.service_role)
+        req.add_header("Authorization", "Bearer " + self.service_role)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = response.read(MAX_AUDIO + 1)
+        except urllib.error.HTTPError:
+            return None
+        except urllib.error.URLError:
+            return None
+        if len(data) > MAX_AUDIO:
+            return None
+        return data
 
     def send_text(self, raw: bytes) -> dict:
         if len(raw) > MAX_BODY:

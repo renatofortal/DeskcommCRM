@@ -1,6 +1,6 @@
 import unittest
 
-from server import OAuthDesk, PHONE_RE, is_allowed, mask_phone, mcp_message, mcp_tools, pkce_s256, summarize_groups
+from server import OAuthDesk, PHONE_RE, audio_blocks, is_allowed, mask_phone, mcp_message, mcp_tools, pkce_s256, summarize_groups
 
 
 class AllowlistTest(unittest.TestCase):
@@ -47,7 +47,7 @@ class McpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["result"]["serverInfo"]["name"], "whatsapp-assistente")
         status, listed = mcp_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, lambda name, arguments: "")
-        self.assertEqual(len(listed["result"]["tools"]), 8)
+        self.assertEqual(len(listed["result"]["tools"]), 9)
 
     def test_aviso_sem_corpo(self):
         status, payload = mcp_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, lambda name, arguments: "")
@@ -67,6 +67,14 @@ class McpTest(unittest.TestCase):
         self.assertEqual(brief["meta"]["count"], 1)
         self.assertEqual(brief["data"][0]["nome"], "Equipe")
         self.assertNotIn("5585992001234", str(brief))
+
+    def test_audio_leva_arquivo_e_transcricao(self):
+        blocks = audio_blocks({"transcricao": "bom dia"}, b"abc", "audio/ogg")
+        self.assertEqual(blocks[0]["type"], "text")
+        self.assertIn("bom dia", blocks[0]["text"])
+        self.assertEqual(blocks[1]["type"], "audio")
+        self.assertEqual(blocks[1]["mimeType"], "audio/ogg")
+        self.assertNotIn("abc", blocks[0]["text"])
 
 
 class OAuthTest(unittest.TestCase):

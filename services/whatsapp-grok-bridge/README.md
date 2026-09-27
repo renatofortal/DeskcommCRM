@@ -70,7 +70,7 @@ curl.exe -s -H "Authorization: Bearer <BRIDGE_TOKEN>" http://127.0.0.1:3011/v1/m
 curl.exe -s -H "Authorization: Bearer <BRIDGE_TOKEN>" http://127.0.0.1:3011/v1/session
 ```
 
-A lista traz no máximo as 50 mensagens mais recentes.
+A lista traz no máximo as 50 mensagens mais recentes. Áudio já transcrito vem no campo `transcricao`. Para ouvir o arquivo, use a ferramenta `whatsapp_audio` com o id da mensagem.
 
 ## Grupos, contatos, etiquetas e status
 
