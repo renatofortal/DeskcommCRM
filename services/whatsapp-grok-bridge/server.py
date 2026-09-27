@@ -634,6 +634,8 @@ class Bridge:
         self.oauth = OAuthDesk(self.token)
         self._hits: list[float] = []
         self._channel: tuple[str, str] | None = None
+        self._offline_stop = threading.Event()
+        threading.Thread(target=self._manter_offline, name="presenca-offline", daemon=True).start()
 
     def authorize(self, header: str | None) -> None:
         if not header or not header.startswith("Bearer "):
@@ -1028,18 +1030,53 @@ class Bridge:
         if data is not None:
             req.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(req, timeout=30) as response:
-                raw = response.read().decode("utf-8")
-                return response.status, json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", "replace")
             try:
-                parsed = json.loads(raw) if raw else {}
-            except json.JSONDecodeError:
-                parsed = {}
-            return exc.code, parsed
-        except urllib.error.URLError:
-            raise BridgeError(502, "WhatsApp indisponivel.")
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    raw = response.read().decode("utf-8")
+                    return response.status, json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as exc:
+                raw = exc.read().decode("utf-8", "replace")
+                try:
+                    parsed = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    parsed = {}
+                return exc.code, parsed
+            except urllib.error.URLError:
+                raise BridgeError(502, "WhatsApp indisponivel.")
+        finally:
+            if "/presence" not in path:
+                self._soltar_presenca()
+
+    def marcar_offline(self) -> int:
+        path = "/api/" + urllib.parse.quote(self.session, safe="") + "/presence"
+        req = urllib.request.Request(
+            self.waha_base + path,
+            data=b'{"presence":"offline"}',
+            method="POST",
+        )
+        req.add_header("X-Api-Key", self.waha_key)
+        req.add_header("Accept", "application/json")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as response:
+                response.read()
+                return response.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return 0
+
+    def _soltar_presenca(self) -> None:
+        def depois() -> None:
+            time.sleep(3)
+            self.marcar_offline()
+
+        threading.Thread(target=depois, daemon=True).start()
+
+    def _manter_offline(self) -> None:
+        while not self._offline_stop.is_set():
+            self.marcar_offline()
+            self._offline_stop.wait(20)
 
 
 def make_handler(bridge: Bridge):

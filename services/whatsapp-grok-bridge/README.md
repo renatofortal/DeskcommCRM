@@ -70,6 +70,8 @@ curl.exe -s -H "Authorization: Bearer <BRIDGE_TOKEN>" http://127.0.0.1:3011/v1/m
 curl.exe -s -H "Authorization: Bearer <BRIDGE_TOKEN>" http://127.0.0.1:3011/v1/session
 ```
 
+A ponte avisa o WhatsApp, a cada poucos segundos, que o aparelho ligado no servidor está indisponível. Quem olha o contato vê a última vez do aplicativo do celular. Abrir o aplicativo no telefone continua mostrando online.
+
 A lista traz no máximo as 50 mensagens mais recentes, com `confirmacao` (`enviada`, `entregue`, `lida` ou `ouvida`). Para uma mensagem específica, use `whatsapp_confirmacao` com o id. Para ouvir um áudio, use `whatsapp_audio`. Para ver uma foto, use `whatsapp_imagem`.
 
 ## Grupos, contatos, etiquetas e status
