@@ -25,10 +25,16 @@ ssh -N -L 127.0.0.1:3011:127.0.0.1:3011 root@89.116.73.110
 
 Base: `http://127.0.0.1:3011`
 
-O túnel serve para um programa rodando neste computador. Um Grok na nuvem não
-entra por esse túnel. Para isso é preciso um conector (MCP ou ação HTTPS) que
-chame esta API, e a decisão de publicar o endereço com HTTPS fica para quando
-esse conector existir.
+O túnel serve para um programa rodando neste computador. O Grok da xAI, no
+computador e no celular, usa outro endereço, com cadeado, no mesmo site do CRM:
+
+`https://crm.verticesales.com.br/wa-assistente/mcp`
+
+Esse endereço só abre o conector. O painel do WhatsApp continua fechado.
+No Grok: grok.com/connectors, Novo conector, Personalizado. Cole a URL acima
+e, no campo de autenticação, o valor de `BRIDGE_TOKEN` como
+`Bearer <token>`. O conector fica na conta, então o celular passa a enxergar
+as mesmas ferramentas.
 
 ## Credencial
 

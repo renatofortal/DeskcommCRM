@@ -75,6 +75,159 @@ def _clean_path(path: str) -> str:
     return path
 
 
+def is_mcp(path: str) -> bool:
+    clean = _clean_path(path)
+    return clean in ("/mcp", "/wa-assistente/mcp")
+
+
+def mcp_tools() -> list[dict]:
+    conta = "Somente o WhatsApp +5585992001234. Nao ha outra sessao."
+    return [
+        {
+            "name": "whatsapp_sessao",
+            "description": conta + " Le o estado da conexao. Nao envia mensagem.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "whatsapp_mensagens",
+            "description": "Lista as 50 mensagens mais recentes guardadas no CRM, inclusive as enviadas pelo aplicativo do celular.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "whatsapp_grupos",
+            "description": "Lista os grupos deste WhatsApp: id, nome e quantidade de participantes.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "whatsapp_grupo",
+            "description": "Detalha um grupo pelo id terminado em @g.us.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "whatsapp_contatos",
+            "description": "Lista a agenda deste WhatsApp. Se a store do motor estiver desligada, devolve esse erro e para.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "whatsapp_etiquetas",
+            "description": "Lista as etiquetas deste WhatsApp. Se a store do motor estiver desligada, devolve esse erro e para.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        {
+            "name": "whatsapp_enviar_texto",
+            "description": (
+                "Envia um texto por este WhatsApp somente quando a pessoa pediu nesta conversa. "
+                "Use to com DDI e DDD para pessoa, ou chat_id terminado em @c.us ou @g.us."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string"},
+                    "chat_id": {"type": "string"},
+                    "text": {"type": "string"},
+                },
+                "required": ["text"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "whatsapp_status",
+            "description": "Publica um status de texto neste WhatsApp somente quando a pessoa pediu nesta conversa. Sem texto, apenas reserva um id e nao publica.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+
+def _group_brief(group_id: str, group: object) -> dict:
+    if not isinstance(group, dict):
+        return {"id": group_id, "nome": "", "participantes": 0}
+    participants = group.get("participants")
+    size = len(participants) if isinstance(participants, list) else group.get("size") or 0
+    return {
+        "id": str(group.get("id") or group_id),
+        "nome": str(group.get("subject") or group.get("name") or ""),
+        "participantes": size,
+    }
+
+
+def summarize_groups(payload: object) -> dict:
+    rows = []
+    if isinstance(payload, dict):
+        source = payload.items()
+    elif isinstance(payload, list):
+        source = ((str(item.get("id") if isinstance(item, dict) else ""), item) for item in payload)
+    else:
+        return {"data": [], "meta": {"count": 0}}
+    for group_id, group in source:
+        if group_id == "error" or not str(group_id).endswith("@g.us") and not isinstance(group, dict):
+            continue
+        brief = _group_brief(str(group_id), group)
+        if brief["id"].endswith("@g.us") or brief["nome"]:
+            rows.append(brief)
+    return {"data": rows, "meta": {"count": len(rows)}}
+
+
+CHAT_ID_RE = re.compile(r"^\d{5,30}@(c\.us|g\.us)$")
+
+
+def mcp_message(payload: object, invoke) -> tuple[int, dict | None]:
+    if not isinstance(payload, dict):
+        return 400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Pedido invalido."}}
+    method = str(payload.get("method") or "")
+    request_id = payload.get("id")
+    if "id" not in payload:
+        return 202, None
+    if method == "initialize":
+        params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+        version = str(params.get("protocolVersion") or "2025-03-26")
+        if version not in ("2025-03-26", "2025-06-18"):
+            version = "2025-03-26"
+        return 200, {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": version,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "whatsapp-assistente", "version": "1"},
+            },
+        }
+    if method == "ping":
+        return 200, {"jsonrpc": "2.0", "id": request_id, "result": {}}
+    if method == "tools/list":
+        return 200, {"jsonrpc": "2.0", "id": request_id, "result": {"tools": mcp_tools()}}
+    if method == "tools/call":
+        params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+        name = str(params.get("name") or "")
+        arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+        known = {tool["name"] for tool in mcp_tools()}
+        if name not in known:
+            return 200, {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "Ferramenta desconhecida."}}
+        try:
+            text = invoke(name, arguments)
+        except BridgeError as exc:
+            text = exc.message
+            return 200, {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"content": [{"type": "text", "text": text}], "isError": True},
+            }
+        return 200, {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"content": [{"type": "text", "text": text}], "isError": False},
+        }
+    return 200, {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Metodo desconhecido."}}
+
+
 def is_allowed(method: str, path: str) -> bool:
     path = _clean_path(path)
     if ".." in path or "\\" in path:
@@ -139,6 +292,58 @@ class Bridge:
         if method == "POST" and path == "/v1/messages":
             return self.send_text(body or b"")
         return self.proxy(method, path, target, body or b"")
+
+    def mcp_invoke(self, name: str, arguments: dict) -> str:
+        if name == "whatsapp_sessao":
+            result = self.session_status()
+        elif name == "whatsapp_mensagens":
+            result = self.list_messages()
+        elif name == "whatsapp_grupos":
+            result = summarize_groups(self.proxy("GET", "/v1/groups", "/v1/groups", b""))
+        elif name == "whatsapp_grupo":
+            group_id = str(arguments.get("id") or "")
+            if not CHAT_ID_RE.match(group_id) or not group_id.endswith("@g.us"):
+                raise BridgeError(400, "Informe o id do grupo terminado em @g.us.")
+            result = _group_brief(group_id, self.proxy("GET", "/v1/groups/" + group_id, "/v1/groups/" + group_id, b""))
+        elif name == "whatsapp_contatos":
+            result = self._mcp_proxy("GET", "/v1/contacts/all")
+        elif name == "whatsapp_etiquetas":
+            result = self._mcp_proxy("GET", "/v1/labels")
+        elif name == "whatsapp_enviar_texto":
+            text = str(arguments.get("text") or "").strip()
+            chat_id = str(arguments.get("chat_id") or "")
+            if chat_id:
+                if not CHAT_ID_RE.match(chat_id):
+                    raise BridgeError(400, "chat_id precisa terminar em @c.us ou @g.us.")
+                if not text or len(text) > 4000:
+                    raise BridgeError(400, "Informe text com ate 4000 caracteres.")
+                code, sent = self._waha("POST", "/api/sendText", {"session": self.session, "chatId": chat_id, "text": text})
+                if code == 403:
+                    raise BridgeError(403, "Envio recusado pela chave da sessao.")
+                if code not in (200, 201):
+                    raise BridgeError(502, "O WhatsApp nao aceitou o envio.")
+                result = {"data": {"chat_id": chat_id}}
+            else:
+                result = self.send_text(json.dumps({"to": arguments.get("to") or "", "text": text}).encode("utf-8"))
+        elif name == "whatsapp_status":
+            text = str(arguments.get("text") or "").strip()
+            if not text:
+                result = self._mcp_proxy("GET", "/v1/status/new-message-id")
+            else:
+                if len(text) > 700:
+                    raise BridgeError(400, "O status aceita ate 700 caracteres.")
+                result = self._mcp_proxy("POST", "/v1/status/text", json.dumps({"text": text}).encode("utf-8"))
+        else:
+            raise BridgeError(404, "Ferramenta desconhecida.")
+        return json.dumps(result, ensure_ascii=False)
+
+    def _mcp_proxy(self, method: str, path: str, raw: bytes = b"") -> object:
+        try:
+            return self.proxy(method, path, path, raw)
+        except BridgeError as exc:
+            if exc.status < 500:
+                return {"error": {"message": exc.message}}
+            raise
 
     def session_status(self) -> dict:
         code, payload = self._waha("GET", f"/api/sessions/{self.session}")
@@ -342,6 +547,12 @@ def make_handler(bridge: Bridge):
                 self._send(413, {"error": {"message": "Pedido grande demais."}})
                 return
             raw = self.rfile.read(length) if length else b""
+            if is_mcp(self.path) and self.command == "GET":
+                self._send(200, {"ok": True, "mcp": True})
+                return
+            if is_mcp(self.path) and self.command == "POST":
+                self._mcp(raw)
+                return
             try:
                 bridge.authorize(self.headers.get("Authorization"))
                 payload = bridge.route(self.command, self.path, raw)
@@ -352,6 +563,31 @@ def make_handler(bridge: Bridge):
                 body = json.dumps({"error": {"message": exc.message}}).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _mcp(self, raw: bytes):
+            try:
+                bridge.authorize(self.headers.get("Authorization"))
+                try:
+                    incoming = json.loads(raw.decode("utf-8")) if raw else None
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    incoming = None
+                status, payload = mcp_message(incoming, bridge.mcp_invoke)
+            except BridgeError as exc:
+                status = exc.status
+                payload = {"jsonrpc": "2.0", "id": None, "error": {"code": -32001, "message": exc.message}}
+            if status == 202:
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            if status == 401:
+                self.send_header("WWW-Authenticate", 'Bearer realm="whatsapp"')
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
