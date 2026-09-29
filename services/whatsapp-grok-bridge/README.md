@@ -80,7 +80,7 @@ Todos os grupos deste WhatsApp entram na memória. `whatsapp_mensagens_grupo` l�
 
 Para marcar alguém num grupo, o envio leva `mentions` com o telefone. O conector coloca a marcação de verdade. A confirmação acha a mensagem do grupo e diz quem leu e quem só recebeu, pelo nome da agenda ou pelo telefone quando o nome não existe.
 
-A lista traz no máximo as 50 mensagens mais recentes, com `confirmacao` (`enviada`, `entregue`, `lida` ou `ouvida`). Para uma mensagem específica, use `whatsapp_confirmacao` com o id. Para ouvir um áudio, use `whatsapp_audio`. Para ver uma foto, use `whatsapp_imagem`. O id da mensagem acha o arquivo na conta certa, mesmo quando a chamada não repete o DDD.
+A lista traz no máximo as 50 mensagens mais recentes, com `confirmacao` (`enviada`, `entregue`, `lida` ou `ouvida`). Para uma mensagem específica, use `whatsapp_confirmacao` com o id. Para ouvir um áudio, use `whatsapp_audio`. Para ver uma foto, use `whatsapp_imagem`. O id da mensagem acha o arquivo na conta certa, mesmo quando a chamada não repete o DDD. Se o CRM só guardou o aviso de que não conseguiu interpretar a mídia, o conector transcreve o arquivo com a chave do Gemini (`GEMINI_API_KEY`) e grava o texto de volta. Sem essa chave, tenta a chave de IA que já estiver na instalação.
 
 ## Grupos, contatos, etiquetas e status
 

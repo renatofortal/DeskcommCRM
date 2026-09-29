@@ -68,6 +68,101 @@ def _scrub(text: str) -> str:
     return text[:180]
 
 
+MARCADOR_NAO_LIDA = "[o cliente enviou uma mídia que não consegui interpretar]"
+
+
+def transcricao_pronta(texto: str) -> bool:
+    limpo = (texto or "").strip()
+    return bool(limpo) and limpo != MARCADOR_NAO_LIDA
+
+
+def formato_de_audio(mime: str) -> str:
+    base = (mime or "").split(";", 1)[0].strip().lower()
+    if "mpeg" in base or "mp3" in base:
+        return "mp3"
+    for nome in ("ogg", "mp4", "m4a", "webm", "wav", "flac", "aac"):
+        if nome in base:
+            return nome
+    return "ogg"
+
+
+GEMINI_MODELO = "gemini-3.5-flash"
+
+
+def transcrever_gemini(chave: str, audio: bytes, mime: str) -> tuple[str | None, str | None]:
+    """Devolve o texto e, se nao houver, o motivo curto: cota ou falha."""
+    if not chave or not audio:
+        return None, None
+    mime_base = (mime or "audio/ogg").split(";", 1)[0].strip() or "audio/ogg"
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        + GEMINI_MODELO
+        + ":generateContent"
+    )
+    body = json.dumps({
+        "contents": [{
+            "parts": [
+                {"text": "Transcreva a fala deste audio. Responda somente com o que foi dito, no idioma original, sem comentario."},
+                {"inline_data": {"mime_type": mime_base, "data": base64.b64encode(audio).decode("ascii")}},
+            ],
+        }],
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("x-goog-api-key", chave)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return None, "cota" if exc.code in (402, 429) else "falha"
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return None, "falha"
+    texto = ""
+    candidatos = payload.get("candidates") if isinstance(payload, dict) else None
+    if isinstance(candidatos, list) and candidatos and isinstance(candidatos[0], dict):
+        content = candidatos[0].get("content") if isinstance(candidatos[0].get("content"), dict) else {}
+        for part in content.get("parts") or []:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                texto += part["text"]
+    texto = texto.strip()
+    if not transcricao_pronta(texto):
+        return None, "falha"
+    return texto[:4000], None
+
+
+def transcrever_openrouter(chave: str, audio: bytes, mime: str) -> tuple[str | None, str | None]:
+    """Devolve o texto e, se nao houver, o motivo curto: saldo ou falha."""
+    if not chave or not audio:
+        return None, None
+    body = json.dumps({
+        "model": "openai/whisper-1",
+        "input_audio": {
+            "data": base64.b64encode(audio).decode("ascii"),
+            "format": formato_de_audio(mime),
+        },
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/audio/transcriptions",
+        data=body,
+        method="POST",
+    )
+    req.add_header("Authorization", "Bearer " + chave)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return None, "saldo" if exc.code == 402 else "falha"
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return None, "falha"
+    text = payload.get("text") if isinstance(payload, dict) else None
+    if not isinstance(text, str) or not transcricao_pronta(text):
+        return None, "falha"
+    return text.strip()[:4000], None
+
+
 def mask_phone(value: str) -> str:
     digits = re.sub(r"\D", "", value or "")
     if len(digits) < 6:
@@ -195,7 +290,7 @@ def _mcp_tools() -> list[dict]:
         },
         {
             "name": "whatsapp_audio",
-            "description": "Ouve um audio do WhatsApp. Devolve a transcricao e o arquivo. O id e o da mensagem e vale em qualquer conta deste conector.",
+            "description": "Ouve um audio do WhatsApp. Devolve a transcricao e o arquivo. Se o CRM nao transcreveu, o conector transcreve na hora. O id vale em qualquer conta deste conector.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string"}},
@@ -1059,6 +1154,8 @@ class Bridge:
         crm = load_env_file(env.get("CRM_ENV_FILE", "/root/deskcommcrm/.env"))
         self.supabase = crm["NEXT_PUBLIC_SUPABASE_URL"].rstrip("/")
         self.service_role = crm["SUPABASE_SERVICE_ROLE_KEY"]
+        self.openrouter_key = crm.get("OPENROUTER_API_KEY") or ""
+        self.gemini_key = crm.get("GEMINI_API_KEY") or ""
         self.oauth = OAuthDesk(self.token)
         self._hits: list[float] = []
         self._canais: dict[str, tuple[str, str]] = {}
@@ -1344,19 +1441,36 @@ class Bridge:
             contact = contact[0] if contact else {}
         if not isinstance(contact, dict):
             contact = {}
+        texto = str(row.get("media_derived_text") or "")
+        audio = self._download_media(str(row.get("media_storage_path") or ""), MAX_AUDIO)
+        motivo = None
+        if audio and not transcricao_pronta(texto):
+            nova = None
+            if self.gemini_key:
+                nova, motivo = transcrever_gemini(self.gemini_key, audio, mime)
+            elif self.openrouter_key:
+                nova, motivo = transcrever_openrouter(self.openrouter_key, audio, mime)
+            if nova:
+                texto = nova
+                self._guardar_transcricao(str(row.get("id") or message_id), nova)
         summary = {
             "id": row.get("id"),
             "sent_at": row.get("sent_at"),
             "contato": contact.get("display_name") or "",
             "telefone": mask_phone(str(contact.get("phone_number") or "")),
-            "transcricao": row.get("media_derived_text") or "",
-            "transcricao_status": row.get("media_derived_status") or "",
+            "transcricao": texto if transcricao_pronta(texto) else "",
+            "transcricao_status": "ready" if transcricao_pronta(texto) else (row.get("media_derived_status") or ""),
         }
-        audio = self._download_media(str(row.get("media_storage_path") or ""), MAX_AUDIO)
         if audio is None and not summary["transcricao"]:
             summary["aviso"] = "O arquivo de audio nao esta guardado."
         elif audio is None:
             summary["aviso"] = "A transcricao esta pronta. O arquivo passou do tamanho que o conector envia."
+        elif motivo == "saldo":
+            summary["aviso"] = "O arquivo esta anexado. A conta de IA nao tem saldo para transcrever audio."
+        elif motivo == "cota":
+            summary["aviso"] = "O arquivo esta anexado. A cota do Gemini para audio acabou agora."
+        elif not summary["transcricao"]:
+            summary["aviso"] = "O arquivo esta anexado. Nao foi possivel transcrever agora."
         return audio_blocks(summary, audio, mime if mime.startswith("audio/") else "audio/ogg")
 
     def image_message(self, message_id: str) -> list:
@@ -1389,6 +1503,29 @@ class Bridge:
         if image is None:
             summary["aviso"] = "O arquivo da imagem nao esta guardado ou passou do tamanho que o conector envia."
         return image_blocks(summary, image, mime if mime.startswith("image/") else "image/jpeg")
+
+    def _guardar_transcricao(self, message_id: str, texto: str) -> None:
+        if not UUID_RE.match(message_id) or not transcricao_pronta(texto):
+            return
+        try:
+            _, org_id = self._channel_ids()
+        except BridgeError:
+            return
+        url = self.supabase + "/rest/v1/messages?id=eq." + message_id + "&organization_id=eq." + org_id
+        req = urllib.request.Request(
+            url,
+            data=json.dumps({"media_derived_text": texto, "media_derived_status": "ready"}).encode("utf-8"),
+            method="PATCH",
+        )
+        req.add_header("apikey", self.service_role)
+        req.add_header("Authorization", "Bearer " + self.service_role)
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Prefer", "return=minimal")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                response.read()
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+            return
 
     def _download_media(self, path: str, limit: int) -> bytes | None:
         if not path or ".." in path or path.startswith("/"):

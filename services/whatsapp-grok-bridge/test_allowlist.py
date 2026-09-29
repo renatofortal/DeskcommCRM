@@ -23,7 +23,9 @@ from server import (
     id_publico,
     image_blocks,
     is_allowed,
+    formato_de_audio,
     mask_phone,
+    transcricao_pronta,
     montar_contas,
     mcp_message,
     mcp_tools,
@@ -58,6 +60,15 @@ class AllowlistTest(unittest.TestCase):
     def test_mascara(self):
         self.assertEqual(mask_phone("5511999999999"), "5511****99")
         self.assertNotIn("999999", mask_phone("5511999999999"))
+
+    def test_aviso_de_falha_nao_e_transcricao(self):
+        self.assertFalse(transcricao_pronta(""))
+        self.assertFalse(transcricao_pronta("[o cliente enviou uma mídia que não consegui interpretar]"))
+        self.assertTrue(transcricao_pronta("pode me ligar amanha"))
+
+    def test_formato_do_audio_do_whatsapp(self):
+        self.assertEqual(formato_de_audio("audio/ogg; codecs=opus"), "ogg")
+        self.assertEqual(formato_de_audio("audio/mpeg"), "mp3")
 
 
 class McpTest(unittest.TestCase):
