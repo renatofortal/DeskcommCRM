@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Ponte autenticada entre um cliente externo e um único WhatsApp.
+"""Ponte autenticada entre um cliente externo e os WhatsApps configurados.
 
 A chave do WAHA fica neste servidor. O cliente só fala com esta ponte.
 Ela aceita o histórico do CRM, o envio de mensagens e os recursos de
-grupos, contatos, etiquetas e status da sessão configurada. Não escolhe
-outra sessão e não executa logout, start, stop, restart, exclusão da
-sessão nem troca de chave. Não há rotina de resposta automática.
+grupos, contatos, etiquetas e status das contas em WAHA_SESSION e
+WAHA_CONTAS. Sem o campo conta, usa a conta padrão. Não executa logout,
+start, stop, restart, exclusão da sessão nem troca de chave. Não há
+rotina de resposta automática.
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+ROTULO_RE = re.compile(r"^[A-Za-z0-9]{1,16}$")
 PHONE_RE = re.compile(r"^[1-9]\d{9,14}$")
 MAX_BODY = 8 * 1024 * 1024
 WINDOW_S = 60
@@ -73,6 +75,82 @@ def mask_phone(value: str) -> str:
     return digits[:4] + "****" + digits[-2:]
 
 
+class Conta:
+    def __init__(self, rotulo: str, session: str, key: str):
+        self.rotulo = rotulo
+        self.session = session
+        self.key = key
+
+
+def _ler_chave(path: str) -> str:
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def montar_contas(env: dict[str, str], ler=None) -> tuple[Conta, list[Conta]]:
+    """A primeira conta é a padrão. WAHA_CONTAS soma as outras, no formato rotulo|sessao|arquivo."""
+    ler = ler or _ler_chave
+    session = env["WAHA_SESSION"]
+    if not SESSION_RE.match(session):
+        raise SystemExit("sessao invalida")
+    key = ler(env["WAHA_KEY_FILE"]).strip()
+    if not key or not env.get("BRIDGE_TOKEN"):
+        raise SystemExit("credencial ausente")
+    rotulo = (env.get("WAHA_CONTA") or "principal").strip()
+    if not ROTULO_RE.match(rotulo):
+        raise SystemExit("conta invalida")
+    padrao = Conta(rotulo, session, key)
+    contas = [padrao]
+    extra = (env.get("WAHA_CONTAS") or "").strip()
+    if not extra:
+        return padrao, contas
+    for parte in extra.split(","):
+        parte = parte.strip()
+        if not parte:
+            continue
+        bits = parte.split("|")
+        if len(bits) != 3:
+            raise SystemExit("conta extra invalida")
+        rot, sess, path = (bit.strip() for bit in bits)
+        if not ROTULO_RE.match(rot) or not SESSION_RE.match(sess):
+            raise SystemExit("conta extra invalida")
+        if any(item.rotulo == rot or item.session == sess for item in contas):
+            raise SystemExit("conta duplicada")
+        chave = ler(path).strip()
+        if not chave:
+            raise SystemExit("credencial ausente")
+        contas.append(Conta(rot, sess, chave))
+    return padrao, contas
+
+
+def achar_conta(contas: list[Conta], pedido, padrao: Conta) -> Conta:
+    texto = str(pedido or "").strip()
+    if not texto:
+        return padrao
+    digits = re.sub(r"\D", "", texto)
+    for conta in contas:
+        if texto == conta.rotulo or texto == conta.session:
+            return conta
+        if digits and (digits == conta.rotulo or digits == "55" + conta.rotulo):
+            return conta
+    raise BridgeError(400, "Conta desconhecida. Chame whatsapp_sessao para ver as contas.")
+
+
+def _pedido_conta(target: str, body: bytes | None) -> str | None:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(target).query)
+    if query.get("conta"):
+        return query["conta"][0]
+    if not body:
+        return None
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if isinstance(payload, dict) and payload.get("conta"):
+        return str(payload["conta"])
+    return None
+
+
 def _clean_path(path: str) -> str:
     path = urllib.parse.urlsplit(path).path
     if len(path) > 1 and path.endswith("/"):
@@ -86,11 +164,20 @@ def is_mcp(path: str) -> bool:
 
 
 def mcp_tools() -> list[dict]:
-    conta = "Somente o WhatsApp +5585992001234. Nao ha outra sessao."
+    tools = _mcp_tools()
+    for tool in tools:
+        tool["inputSchema"].setdefault("properties", {})["conta"] = {
+            "type": "string",
+            "description": "DDD da conta, como 85 ou 11. Sem este campo, usa a conta padrao.",
+        }
+    return tools
+
+
+def _mcp_tools() -> list[dict]:
     return [
         {
             "name": "whatsapp_sessao",
-            "description": conta + " Le o estado da conexao. Nao envia mensagem.",
+            "description": "Lista os WhatsApps deste conector, com o DDD e o telefone mascarado. Passe conta para ver so um. Sem conta, lista todos. Nao envia mensagem.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         },
         {
@@ -166,7 +253,8 @@ def mcp_tools() -> list[dict]:
         {
             "name": "whatsapp_enviar_texto",
             "description": (
-                "Envia um texto por este WhatsApp somente quando a pessoa pediu nesta conversa. "
+                "Envia um texto pela conta escolhida somente quando a pessoa pediu nesta conversa. "
+                "Passe conta com o DDD quando houver mais de um WhatsApp. "
                 "Use to com DDI e DDD para pessoa, ou chat_id terminado em @c.us ou @g.us. "
                 "Para marcar alguem no grupo, passe mentions com o telefone de cada pessoa. "
                 "Depois chame whatsapp_confirmacao com o id devolvido para saber se foi entregue ou lida."
@@ -957,21 +1045,32 @@ def is_allowed(method: str, path: str) -> bool:
 class Bridge:
     def __init__(self, env: dict[str, str]):
         self.token = env["BRIDGE_TOKEN"]
-        self.session = env["WAHA_SESSION"]
+        self._padrao, self.contas = montar_contas(env)
+        self._tls = threading.local()
         self.waha_base = env.get("WAHA_BASE", "http://127.0.0.1:3010").rstrip("/")
-        self.waha_key = open(env["WAHA_KEY_FILE"], encoding="utf-8").read().strip()
         crm = load_env_file(env.get("CRM_ENV_FILE", "/root/deskcommcrm/.env"))
         self.supabase = crm["NEXT_PUBLIC_SUPABASE_URL"].rstrip("/")
         self.service_role = crm["SUPABASE_SERVICE_ROLE_KEY"]
-        if not SESSION_RE.match(self.session):
-            raise SystemExit("sessao invalida")
-        if not self.token or not self.waha_key:
-            raise SystemExit("credencial ausente")
         self.oauth = OAuthDesk(self.token)
         self._hits: list[float] = []
-        self._channel: tuple[str, str] | None = None
+        self._canais: dict[str, tuple[str, str]] = {}
+        self._eu_por_sessao: dict[str, set[str]] = {}
         self._offline_stop = threading.Event()
         threading.Thread(target=self._manter_offline, name="presenca-offline", daemon=True).start()
+
+    @property
+    def session(self) -> str:
+        return getattr(self._tls, "session", self._padrao.session)
+
+    @property
+    def waha_key(self) -> str:
+        return getattr(self._tls, "key", self._padrao.key)
+
+    def usar_conta(self, pedido) -> None:
+        escolhida = achar_conta(self.contas, pedido, self._padrao)
+        self._tls.session = escolhida.session
+        self._tls.key = escolhida.key
+        self._tls.explicita = bool(str(pedido or "").strip())
 
     def authorize(self, header: str | None) -> None:
         if not header or not header.startswith("Bearer "):
@@ -986,6 +1085,7 @@ class Bridge:
         self._hits.append(now)
 
     def route(self, method: str, target: str, body: bytes | None) -> object:
+        self.usar_conta(_pedido_conta(target, body))
         path = _clean_path(target)
         if not is_allowed(method, path):
             raise BridgeError(404, "Caminho nao permitido.")
@@ -998,6 +1098,7 @@ class Bridge:
         return self.proxy(method, path, target, body or b"")
 
     def mcp_invoke(self, name: str, arguments: dict) -> str:
+        self.usar_conta(arguments.get("conta") if isinstance(arguments, dict) else None)
         if name == "whatsapp_sessao":
             result = self.session_status()
         elif name == "whatsapp_mensagens":
@@ -1075,18 +1176,42 @@ class Bridge:
         return summarize_group_messages(payload, rotulos, self._eu_ids())
 
     def session_status(self) -> dict:
-        code, payload = self._waha("GET", f"/api/sessions/{self.session}")
-        if code != 200 or not isinstance(payload, dict):
-            raise BridgeError(502, "Nao foi possivel ler o estado da sessao.")
-        me = payload.get("me") if isinstance(payload.get("me"), dict) else {}
-        return {
-            "data": {
-                "name": self.session,
+        if len(self.contas) > 1 and not getattr(self._tls, "explicita", False):
+            return {"data": [self._resumo(conta) for conta in self.contas]}
+        atual = next((conta for conta in self.contas if conta.session == self.session), self._padrao)
+        return {"data": self._resumo(atual, unica=True)}
+
+    def _resumo(self, conta: Conta, unica: bool = False) -> dict:
+        anterior = (
+            getattr(self._tls, "session", None),
+            getattr(self._tls, "key", None),
+        )
+        self._tls.session = conta.session
+        self._tls.key = conta.key
+        try:
+            code, payload = self._waha("GET", "/api/sessions/" + urllib.parse.quote(conta.session, safe=""))
+            if code != 200 or not isinstance(payload, dict):
+                if not unica and len(self.contas) > 1:
+                    return {"conta": conta.rotulo, "status": "indisponivel", "padrao": conta.session == self._padrao.session}
+                raise BridgeError(502, "Nao foi possivel ler o estado da sessao.")
+            me = payload.get("me") if isinstance(payload.get("me"), dict) else {}
+            resumo = {
+                "conta": conta.rotulo,
                 "status": payload.get("status"),
                 "account": mask_phone(str(me.get("id") or "")),
                 "push_name": me.get("pushName") or "",
+                "padrao": conta.session == self._padrao.session,
             }
-        }
+            if len(self.contas) == 1:
+                resumo["name"] = conta.session
+            return resumo
+        finally:
+            if anterior[0] is None:
+                for attr in ("session", "key"):
+                    if hasattr(self._tls, attr):
+                        delattr(self._tls, attr)
+            else:
+                self._tls.session, self._tls.key = anterior
 
     def list_messages(self) -> dict:
         channel_id, org_id = self._channel_ids()
@@ -1378,7 +1503,7 @@ class Bridge:
         }
 
     def _eu_ids(self) -> set[str]:
-        cached = getattr(self, "_eu_cache", None)
+        cached = self._eu_por_sessao.get(self.session)
         if cached is not None:
             return cached
         ids: set[str] = set()
@@ -1392,7 +1517,7 @@ class Bridge:
             digits = re.sub(r"\D", "", value)
             if digits:
                 ids.add(digits)
-        self._eu_cache = ids
+        self._eu_por_sessao[self.session] = ids
         return ids
 
     def _nomes_no_crm(self, lids: list[str], phones: list[str]) -> tuple[dict[str, str], dict[str, str]]:
@@ -1534,6 +1659,7 @@ class Bridge:
         head, _, tail = rest.partition("/")
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(target).query, keep_blank_values=False)
         query.pop("session", None)
+        query.pop("conta", None)
         if head == "contacts" and (not tail or tail.split("/", 1)[0] in CONTACT_QUERY):
             waha_path = "/api/contacts" + (("/" + tail) if tail else "")
             query["session"] = [self.session]
@@ -1574,21 +1700,24 @@ class Bridge:
             return None
         if not isinstance(payload, dict):
             raise BridgeError(400, "JSON invalido.")
+        payload.pop("conta", None)
         if inject_session or "session" in payload:
             payload["session"] = self.session
         return payload
 
     def _channel_ids(self) -> tuple[str, str]:
-        if self._channel:
-            return self._channel
+        cached = self._canais.get(self.session)
+        if cached:
+            return cached
         rows = self._supabase(
             "channel_sessions?select=id,organization_id"
             f"&waha_session_name=eq.{urllib.parse.quote(self.session)}&limit=1"
         )
         if not rows:
             raise BridgeError(503, "Canal nao encontrado.")
-        self._channel = (rows[0]["id"], rows[0]["organization_id"])
-        return self._channel
+        par = (rows[0]["id"], rows[0]["organization_id"])
+        self._canais[self.session] = par
+        return par
 
     def _supabase(self, query: str) -> list:
         req = urllib.request.Request(self.supabase + "/rest/v1/" + query)
@@ -1638,14 +1767,16 @@ class Bridge:
             if "/presence" not in path:
                 self._soltar_presenca()
 
-    def marcar_offline(self) -> int:
-        path = "/api/" + urllib.parse.quote(self.session, safe="") + "/presence"
+    def marcar_offline(self, session: str | None = None, key: str | None = None) -> int:
+        session = session or self.session
+        key = key or self.waha_key
+        path = "/api/" + urllib.parse.quote(session, safe="") + "/presence"
         req = urllib.request.Request(
             self.waha_base + path,
             data=b'{"presence":"offline"}',
             method="POST",
         )
-        req.add_header("X-Api-Key", self.waha_key)
+        req.add_header("X-Api-Key", key)
         req.add_header("Accept", "application/json")
         req.add_header("Content-Type", "application/json")
         try:
@@ -1658,15 +1789,19 @@ class Bridge:
             return 0
 
     def _soltar_presenca(self) -> None:
+        session = self.session
+        key = self.waha_key
+
         def depois() -> None:
             time.sleep(3)
-            self.marcar_offline()
+            self.marcar_offline(session, key)
 
         threading.Thread(target=depois, daemon=True).start()
 
     def _manter_offline(self) -> None:
         while not self._offline_stop.is_set():
-            self.marcar_offline()
+            for conta in self.contas:
+                self.marcar_offline(conta.session, conta.key)
             self._offline_stop.wait(20)
 
 
@@ -1808,6 +1943,8 @@ def main() -> None:
         "WAHA_BASE": os.environ.get("WAHA_BASE", "http://127.0.0.1:3010"),
         "WAHA_KEY_FILE": os.environ["WAHA_KEY_FILE"],
         "CRM_ENV_FILE": os.environ.get("CRM_ENV_FILE", "/root/deskcommcrm/.env"),
+        "WAHA_CONTA": os.environ.get("WAHA_CONTA", ""),
+        "WAHA_CONTAS": os.environ.get("WAHA_CONTAS", ""),
     }
     bridge = Bridge(env)
     host = os.environ.get("BRIDGE_HOST", "127.0.0.1")

@@ -1,4 +1,4 @@
-# Ponte de leitura e envio para um WhatsApp
+# Ponte de leitura e envio para os WhatsApps configurados
 
 Serviço local. Ele não responde sozinho e não dispara campanha. Uma mensagem
 sai só quando alguém chama `POST /v1/messages`.
@@ -10,8 +10,10 @@ cliente externo usa outro segredo, o `BRIDGE_TOKEN`, no cabeçalho
 O WAHA instalado (2026.7.2 CORE) trata a permissão `send` como um conjunto
 amplo: além de enviar texto, ela libera grupos, contatos, perfil, etiquetas,
 canais, status e alterações de conversa. Esta ponte repassa grupos, contatos,
-etiquetas, status, conversas e o envio de mensagens, sempre na sessão
-configurada em `WAHA_SESSION`. Perfil, canais, logout e gestão da sessão ficam
+etiquetas, status, conversas e o envio de mensagens, na conta pedida.
+`WAHA_SESSION` é a conta padrão. `WAHA_CONTAS` soma as outras, no formato
+`ddd|nome_da_sessao|arquivo_da_chave`, separadas por vírgula. Sem o campo
+`conta`, a chamada usa a padrão. Perfil, canais, logout e gestão da sessão ficam
 de fora.
 
 ## Endereço
@@ -82,7 +84,7 @@ A lista traz no máximo as 50 mensagens mais recentes, com `confirmacao` (`envia
 
 ## Grupos, contatos, etiquetas e status
 
-Estes caminhos repetem a API do WAHA, presos à sessão configurada. O cliente não escolhe outra sessão: se o JSON trouxer `session`, a ponte substitui pelo número autorizado.
+Estes caminhos repetem a API do WAHA, presos à conta pedida. O campo `conta` leva o DDD (`85` ou `11`). Sem ele, vale a conta padrão. Se o JSON trouxer `session`, a ponte troca pelo WhatsApp dessa conta.
 
 ```powershell
 curl.exe -s -H "Authorization: Bearer <BRIDGE_TOKEN>" http://127.0.0.1:3011/v1/groups
@@ -120,7 +122,7 @@ teste que você indicar.
 
 ## O que esta ponte recusa
 
-- outra sessão ou outro número de origem
+- uma conta que não esteja em `WAHA_SESSION` nem em `WAHA_CONTAS`
 - logout, start, stop, restart
 - apagar a sessão, mudar a configuração dela, gerenciar chaves
 - perfil do WhatsApp e qualquer caminho fora dos recursos acima

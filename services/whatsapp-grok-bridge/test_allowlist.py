@@ -2,10 +2,12 @@ import json
 import unittest
 
 from server import (
+    BridgeError,
     OAuthDesk,
     PHONE_RE,
     _receipt_filter,
     _waha_message_id,
+    achar_conta,
     aplicar_marcacoes,
     confirmacao_de_grupo,
     id_bate,
@@ -20,6 +22,7 @@ from server import (
     image_blocks,
     is_allowed,
     mask_phone,
+    montar_contas,
     mcp_message,
     mcp_tools,
     pkce_s256,
@@ -73,6 +76,11 @@ class McpTest(unittest.TestCase):
         self.assertEqual(payload["result"]["serverInfo"]["name"], "whatsapp-assistente")
         status, listed = mcp_message({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, lambda name, arguments: "")
         self.assertEqual(len(listed["result"]["tools"]), 12)
+        texto = json.dumps(listed["result"]["tools"], ensure_ascii=False)
+        self.assertNotIn("Nao ha outra sessao", texto)
+        self.assertNotIn("5585992001234", texto)
+        for tool in listed["result"]["tools"]:
+            self.assertIn("conta", tool["inputSchema"]["properties"])
 
     def test_aviso_sem_corpo(self):
         status, payload = mcp_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, lambda name, arguments: "")
@@ -256,6 +264,36 @@ class OAuthTest(unittest.TestCase):
             }
         )
         self.assertEqual(again, 400)
+
+
+class ContasTest(unittest.TestCase):
+    def test_padrao_e_segunda_pelo_ddd(self):
+        chaves = {"/k85": "chave-85", "/k11": "chave-11"}
+        padrao, contas = montar_contas(
+            {
+                "BRIDGE_TOKEN": "t",
+                "WAHA_SESSION": "org_um",
+                "WAHA_KEY_FILE": "/k85",
+                "WAHA_CONTA": "85",
+                "WAHA_CONTAS": "11|org_dois|/k11",
+            },
+            ler=chaves.get,
+        )
+        self.assertEqual(padrao.rotulo, "85")
+        self.assertEqual(achar_conta(contas, None, padrao).session, "org_um")
+        self.assertEqual(achar_conta(contas, "11", padrao).session, "org_dois")
+        self.assertEqual(achar_conta(contas, "5511", padrao).rotulo, "11")
+        self.assertEqual(achar_conta(contas, "org_dois", padrao).key, "chave-11")
+        with self.assertRaises(BridgeError):
+            achar_conta(contas, "21", padrao)
+
+    def test_sem_extra_continua_uma_conta(self):
+        padrao, contas = montar_contas(
+            {"BRIDGE_TOKEN": "t", "WAHA_SESSION": "org_um", "WAHA_KEY_FILE": "/k"},
+            ler=lambda _path: "chave",
+        )
+        self.assertEqual(len(contas), 1)
+        self.assertEqual(padrao.rotulo, "principal")
 
 
 if __name__ == "__main__":
