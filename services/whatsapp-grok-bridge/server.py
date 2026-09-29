@@ -136,6 +136,14 @@ def achar_conta(contas: list[Conta], pedido, padrao: Conta) -> Conta:
     raise BridgeError(400, "Conta desconhecida. Chame whatsapp_sessao para ver as contas.")
 
 
+def contas_para_buscar(contas: list[Conta], session_atual: str) -> list[Conta]:
+    """A conta da chamada vem primeiro. As outras entram depois, para achar o id que o Grok nao rotulou."""
+    if not contas:
+        return []
+    primeiro = next((conta for conta in contas if conta.session == session_atual), contas[0])
+    return [primeiro, *[conta for conta in contas if conta.session != primeiro.session]]
+
+
 def _pedido_conta(target: str, body: bytes | None) -> str | None:
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(target).query)
     if query.get("conta"):
@@ -187,7 +195,7 @@ def _mcp_tools() -> list[dict]:
         },
         {
             "name": "whatsapp_audio",
-            "description": "Ouve um audio do WhatsApp. Devolve a transcricao e o arquivo. O id e o da mensagem.",
+            "description": "Ouve um audio do WhatsApp. Devolve a transcricao e o arquivo. O id e o da mensagem e vale em qualquer conta deste conector.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string"}},
@@ -207,7 +215,7 @@ def _mcp_tools() -> list[dict]:
         },
         {
             "name": "whatsapp_imagem",
-            "description": "Ve uma imagem do WhatsApp. Devolve o arquivo da foto ou do print. O id e o da mensagem.",
+            "description": "Ve uma imagem do WhatsApp. Devolve o arquivo da foto ou do print. O id e o da mensagem e vale em qualquer conta deste conector.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string"}},
@@ -1246,24 +1254,40 @@ class Bridge:
             )
         return {"data": data, "meta": {"count": len(data)}}
 
+    def _buscar_mensagem(self, columns: str, filtro: str) -> dict | None:
+        for conta in contas_para_buscar(self.contas, self.session):
+            self._tls.session = conta.session
+            self._tls.key = conta.key
+            try:
+                channel_id, org_id = self._channel_ids()
+            except BridgeError:
+                continue
+            rows = self._supabase(
+                "messages?select="
+                + columns
+                + f"&channel_session_id=eq.{channel_id}"
+                + f"&organization_id=eq.{org_id}"
+                + f"&{filtro}"
+                + "&order=sent_at.desc&limit=1"
+            )
+            if rows:
+                return rows[0]
+        return None
+
     def message_receipt(self, message_id: str) -> dict:
-        channel_id, org_id = self._channel_ids()
         lookup = _receipt_filter(message_id)
-        query = (
-            "messages?select=id,external_id,sent_at,direction,type,ack,status,delivered_at,read_at,"
-            "contacts(display_name,phone_number)"
-            f"&channel_session_id=eq.{channel_id}"
-            f"&organization_id=eq.{org_id}"
-            f"&{lookup}"
-            "&order=sent_at.desc&limit=1"
+        row = self._buscar_mensagem(
+            "id,external_id,sent_at,direction,type,ack,status,delivered_at,read_at,contacts(display_name,phone_number)",
+            lookup,
         )
-        rows = self._supabase(query)
-        if not rows:
-            grupo = self._recibo_de_grupo(message_id)
-            if grupo:
-                return grupo
+        if row is None:
+            for conta in contas_para_buscar(self.contas, self.session):
+                self._tls.session = conta.session
+                self._tls.key = conta.key
+                grupo = self._recibo_de_grupo(message_id)
+                if grupo:
+                    return grupo
             raise BridgeError(404, "Mensagem nao encontrada neste WhatsApp. Se acabou de enviar, espere alguns segundos e consulte de novo.")
-        row = rows[0]
         contact = row.get("contacts")
         if isinstance(contact, list):
             contact = contact[0] if contact else {}
@@ -1305,19 +1329,12 @@ class Bridge:
     def audio_message(self, message_id: str) -> list:
         if not UUID_RE.match(message_id):
             raise BridgeError(400, "Informe o id da mensagem.")
-        channel_id, org_id = self._channel_ids()
-        query = (
-            "messages?select=id,type,sent_at,media_mime,media_derived_text,media_derived_status,media_storage_path,"
-            "contacts(display_name,phone_number)"
-            f"&id=eq.{message_id}"
-            f"&channel_session_id=eq.{channel_id}"
-            f"&organization_id=eq.{org_id}"
-            "&limit=1"
+        row = self._buscar_mensagem(
+            "id,type,sent_at,media_mime,media_derived_text,media_derived_status,media_storage_path,contacts(display_name,phone_number)",
+            f"id=eq.{message_id}",
         )
-        rows = self._supabase(query)
-        if not rows:
+        if row is None:
             raise BridgeError(404, "Audio nao encontrado neste WhatsApp.")
-        row = rows[0]
         kind = str(row.get("type") or "")
         mime = str(row.get("media_mime") or "audio/ogg")
         if kind not in AUDIO_TYPES and not mime.startswith("audio/"):
@@ -1345,19 +1362,12 @@ class Bridge:
     def image_message(self, message_id: str) -> list:
         if not UUID_RE.match(message_id):
             raise BridgeError(400, "Informe o id da mensagem.")
-        channel_id, org_id = self._channel_ids()
-        query = (
-            "messages?select=id,type,sent_at,body,media_mime,media_derived_text,media_storage_path,"
-            "contacts(display_name,phone_number)"
-            f"&id=eq.{message_id}"
-            f"&channel_session_id=eq.{channel_id}"
-            f"&organization_id=eq.{org_id}"
-            "&limit=1"
+        row = self._buscar_mensagem(
+            "id,type,sent_at,body,media_mime,media_derived_text,media_storage_path,contacts(display_name,phone_number)",
+            f"id=eq.{message_id}",
         )
-        rows = self._supabase(query)
-        if not rows:
+        if row is None:
             raise BridgeError(404, "Imagem nao encontrada neste WhatsApp.")
-        row = rows[0]
         kind = str(row.get("type") or "")
         mime = str(row.get("media_mime") or "image/jpeg")
         if kind not in IMAGE_TYPES and not mime.startswith("image/"):

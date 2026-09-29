@@ -8,6 +8,7 @@ from server import (
     _receipt_filter,
     _waha_message_id,
     achar_conta,
+    contas_para_buscar,
     aplicar_marcacoes,
     confirmacao_de_grupo,
     id_bate,
@@ -18,6 +19,7 @@ from server import (
     audio_blocks,
     chat_id_com_lid,
     confirmacao_de,
+    Conta,
     id_publico,
     image_blocks,
     is_allowed,
@@ -294,6 +296,12 @@ class ContasTest(unittest.TestCase):
         )
         self.assertEqual(len(contas), 1)
         self.assertEqual(padrao.rotulo, "principal")
+
+    def test_busca_a_conta_atual_e_depois_a_outra(self):
+        contas = [Conta("85", "org_um", "a"), Conta("11", "org_dois", "b")]
+        ordem = contas_para_buscar(contas, "org_dois")
+        self.assertEqual([conta.rotulo for conta in ordem], ["11", "85"])
+        self.assertEqual([conta.rotulo for conta in contas_para_buscar(contas, "org_um")], ["85", "11"])
 
 
 if __name__ == "__main__":
